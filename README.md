@@ -6,7 +6,8 @@ Dockerized Microsoft BitNet b1.58-2B-4T with an OpenAI-compatible API and web in
 
 ```bash
 # 1. Place ggml-model-i2_s.gguf next to the Dockerfile
-huggingface-cli download microsoft/bitnet-b1.58-2B-4T-gguf ggml-model-i2_s.gguf --local-dir .
+huggingface-cli download microsoft/bitnet-b1.58-2B-4T-gguf ggml-model-i2_s.gguf \
+  --revision a1f2f1c765812aa8af3f6eda4a313707064bba15 --local-dir .
 
 # 2. Build and run, publishing a host port so you can reach it locally
 HOST_PORT=8010 ./start.sh
@@ -97,6 +98,33 @@ Features:
 All assets are served from the container. The UI makes no third-party requests
 and works with outbound network access blocked.
 
+## Model
+
+`bitnet-b1.58-2B-4T` is the current and only official **generative** BitNet
+model. Microsoft publishes six BitNet repos, and the newer ones do not replace
+it:
+
+| Repo | Released | Use here |
+|------|----------|----------|
+| `bitnet-b1.58-2B-4T-gguf` | Apr 2025 | **This one** — I2_S, ready for bitnet.cpp |
+| `bitnet-b1.58-2B-4T` | Apr 2025 | Master weights, for transformers/fine-tuning |
+| `bitnet-b1.58-2B-4T-bf16` | Apr 2025 | BF16 master weights, not for CPU inference |
+| `bitnet-embedding-0.6b` | Jul 2026 | Embeddings — produces vectors, not text |
+| `bitnet-embedding-270m` | Jul 2026 | Embeddings |
+| `VibeVoice-ASR-BitNet` | Jul 2026 | Speech recognition |
+
+The 2026 releases are embedding and ASR models; neither can serve a chat API.
+`BitNet a4.8` (4-bit activations) is a paper, not a released model. So there is
+no newer or better option for this deployment.
+
+The GGUF is **pinned by revision and checksum** in `start.sh`. The HF repo was
+last updated 2025-12-17, months after its April 2025 release, so an unpinned
+`huggingface-cli download` is a moving target that can change the model under a
+rebuild. `start.sh` verifies the checksum and warns on a mismatch rather than
+failing, since swapping in a fine-tune is a legitimate thing to do deliberately.
+To move to a different revision, update `MODEL_REVISION` and `MODEL_SHA256`
+together.
+
 ## Prompt format
 
 Prompts are built in `app.py` to match the chat template in
@@ -163,6 +191,30 @@ because `src/CMakeLists.txt` compiles `ggml-bitnet-lut.cpp` unconditionally and
 that file includes the generated header, but TL2 itself is disabled via
 `-DBITNET_X86_TL2=OFF`, matching what `setup_env.py` passes on x86_64.
 
+### Why the binary is called `llama-server`
+
+This runs **bitnet.cpp**, not stock llama.cpp — the binary name is inherited,
+not a sign of the wrong engine. There is no separate `bitnet-server`.
+
+bitnet.cpp's own top-level `CMakeLists.txt` builds both its ternary kernels and
+a vendored copy of llama.cpp:
+
+```cmake
+add_subdirectory(src)                  # ggml-bitnet-lut.cpp, ggml-bitnet-mad.cpp
+add_subdirectory(3rdparty/llama.cpp)   # vendored dependency, not an alternative
+set(LLAMA_BUILD_SERVER ON CACHE BOOL "Build llama.cpp server" FORCE)
+```
+
+llama.cpp is a component *inside* bitnet.cpp, and the server is force-enabled by
+bitnet.cpp itself, so it is a first-class output of this build rather than
+something bolted on here. The simplest proof that the ternary kernels are live:
+stock llama.cpp cannot load an I2_S model at all, and this one serves one.
+
+Note that the upstream changelog's embedding-model guides (0.6B/270M) and the
+TL1/TL2 tiling work in `docs/codegen.md` do not apply to this deployment — the
+first covers embedding models rather than generative ones, and the second covers
+lookup-table kernels that are disabled here.
+
 ## Configuration
 
 | Variable | Default | Description |
@@ -185,6 +237,12 @@ that file includes the generated header, but TL2 itself is disabled via
 measured value; upstream benchmarks x86 at 8 threads. Measure on the deployment
 host before changing it — more threads than physical cores usually costs
 throughput.
+
+ggml defaults `GGML_NATIVE=ON`, so the binary is compiled `-march=native` for
+whichever machine ran `docker build`. That is the right setting here because
+`start.sh` builds on the host that serves. It only matters if you ever build the
+image somewhere else and copy it — a different CPU would fault on instructions
+the build host had.
 
 ## Development
 
