@@ -23,7 +23,7 @@ from typing import Literal
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import BaseModel, Field, ValidationError
@@ -677,6 +677,18 @@ async def health(request: Request):
         raise HTTPException(
             status_code=503, detail={"status": "degraded", "backend": "unavailable"}
         ) from exc
+
+
+@app.get("/")
+async def root():
+    """Send the bare domain to the UI.
+
+    There has never been a route here -- the original app.py served the UI at
+    /inference only -- so hitting the domain returned a bare JSON 404 that reads
+    like the deployment is broken when it is fine. Redirect rather than moving
+    the UI, so existing links to /inference keep working.
+    """
+    return RedirectResponse("/inference")
 
 
 @app.get("/inference")

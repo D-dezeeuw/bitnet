@@ -78,3 +78,11 @@ class TestUI:
     async def test_vendored_libraries_are_served_locally(self, client):
         for path in ("/static/vendor/marked.min.js", "/static/vendor/purify.min.js"):
             assert (await client.get(path)).status_code == 200
+
+
+async def test_root_redirects_to_the_ui(client):
+    """The bare domain used to return a JSON 404, which reads like a broken
+    deployment when the UI is simply at another path."""
+    r = await client.get("/", follow_redirects=False)
+    assert r.status_code in (307, 308)
+    assert r.headers["location"] == "/inference"
