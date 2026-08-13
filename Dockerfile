@@ -127,10 +127,23 @@ COPY ggml-model-i2_s.gguf /app/models/model.gguf
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-COPY app.py /app/app.py
+# A glob rather than one COPY per file. Naming app.py alone meant that adding
+# mcp_server.py produced an image that built cleanly and then crash-looped on
+# ModuleNotFoundError at startup. .dockerignore keeps tests/ and caches out, so
+# this is only the application modules.
+COPY *.py /app/
 COPY static/ /app/static/
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
+
+# Import the app at build time. It is the cheapest possible check that every
+# module the app imports is actually present in the image and that its
+# dependencies resolve -- the failure this catches was previously only visible
+# as a restart loop in `docker logs` after a 20-minute build and a deploy.
+#
+# Safe at build time: importing app.py builds the settings object and the route
+# table but opens no connection to llama-server, which happens in the lifespan.
+RUN python -c "import app; print('app imports OK')"
 
 # /download serves from here. Nothing is baked in: mount a file at
 # /app/downloads/download.zip to enable it, and the route 404s when absent.
