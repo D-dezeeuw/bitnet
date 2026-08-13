@@ -1,2 +1,20 @@
 .claude
 .git
+.github
+.gitignore
+tests/
+pyproject.toml
+requirements-dev.txt
+README.md
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Served via a bind mount at run time, not baked into the image.
+download.zip
+
+# NOTE: ggml-model-i2_s.gguf is deliberately NOT ignored -- the runtime stage
+# copies it straight from the build context.
