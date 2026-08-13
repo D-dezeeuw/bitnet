@@ -139,6 +139,7 @@ RUN mkdir -p /app/downloads && chown bitnet:bitnet /app/downloads
 ENV MODEL_PATH=/app/models/model.gguf \
     MODEL_ID=bitnet-b1.58-2B-4T \
     LLAMA_SERVER_PORT=8080 \
+    BITNET_API_PORT=8010 \
     BITNET_THREADS=4 \
     BITNET_CTX_SIZE=4096 \
     BITNET_STATIC_DIR=/app/static \
@@ -146,10 +147,16 @@ ENV MODEL_PATH=/app/models/model.gguf \
 # BITNET_API_KEY is intentionally unset: set it at run time to require
 # authentication on every /v1 route. Leaving it unset serves an open endpoint.
 
+# Static metadata, so it cannot follow BITNET_API_PORT. Overriding that variable
+# leaves this line stale but harmless -- publishing is done by `docker run -p`,
+# which start.sh derives from the same variable.
 EXPOSE 8010
 
+# Follows BITNET_API_PORT rather than hardcoding 8010: the probe has to hit the
+# port uvicorn actually bound, or overriding the port marks the container
+# unhealthy while it is serving perfectly well.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=180s --retries=3 \
-    CMD curl -fsS http://127.0.0.1:8010/health || exit 1
+    CMD curl -fsS "http://127.0.0.1:${BITNET_API_PORT:-8010}/health" || exit 1
 
 USER bitnet
 

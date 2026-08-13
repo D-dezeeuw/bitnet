@@ -4,6 +4,10 @@
 # Optional payload served by /download, mounted at run time.
 download.zip
 
+# Local configuration. Holds BITNET_API_KEY, so it must never be committed.
+# .env.example is the tracked template.
+.env
+
 # Python
 __pycache__/
 *.py[cod]
