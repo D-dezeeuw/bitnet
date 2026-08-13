@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Test
+        # The suite runs against a stub of llama-server, so it needs neither the
+        # 1.2 GB GGUF nor a compiled backend.
+        run: pytest
+
+  dockerfile-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          failure-threshold: warning
+
+# The image build is deliberately not run here. It compiles bitnet.cpp's
+# llama.cpp fork from source and needs ggml-model-i2_s.gguf in the build
+# context, which is far outside what a hosted runner should carry. Build it
+# locally with ./start.sh.

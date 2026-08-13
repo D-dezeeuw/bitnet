@@ -1,0 +1,18 @@
+# Model weights: ~1.2 GB. Committing one is effectively permanent.
+*.gguf
+
+# Optional payload served by /download, mounted at run time.
+download.zip
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# Local build output
+build/
+logs/

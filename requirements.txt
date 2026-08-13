@@ -1,0 +1,8 @@
+# Runtime dependencies for the API layer.
+# These are the app's own dependencies -- unrelated to BitNet's requirements.txt,
+# which exists only for the HF->GGUF conversion scripts and is not needed here
+# because the model ships pre-converted.
+fastapi==0.115.12
+uvicorn==0.34.0
+httpx==0.28.1
+pydantic==2.11.1
