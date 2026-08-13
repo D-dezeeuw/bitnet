@@ -7,6 +7,11 @@
 # mismatch at load time rather than a build error.
 FROM python:3.11-slim-bookworm AS builder
 
+# Deliberately unpinned: Debian prunes superseded point releases from the
+# archive, so a pinned apt version turns into a build that stops working with
+# no change here. The upstream source is pinned instead, which is what governs
+# what actually ends up in the binary.
+# hadolint ignore=DL3008
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     cmake \
@@ -77,6 +82,8 @@ RUN mkdir -p /build/collected_libs \
 #
 FROM python:3.13-slim-bookworm
 
+# Unpinned for the same reason as the builder stage.
+# hadolint ignore=DL3008
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     libgomp1 \
@@ -92,8 +99,14 @@ COPY --from=builder /build/collected_libs/ /usr/local/lib/
 RUN ldconfig
 
 # Fail the build, not the container, if a shared library did not come across.
-RUN ldd /usr/local/bin/llama-server \
-    && ! ldd /usr/local/bin/llama-server | grep -q "not found"
+# Written without a pipe so the exit status is unambiguous.
+RUN ldd /usr/local/bin/llama-server > /tmp/ldd.out 2>&1; \
+    cat /tmp/ldd.out; \
+    if grep -q "not found" /tmp/ldd.out; then \
+        echo "ERROR: llama-server is missing shared libraries (see above)" >&2; \
+        exit 1; \
+    fi; \
+    rm /tmp/ldd.out
 
 # The model is copied straight from the build context into the runtime stage.
 # It is not needed to compile anything, so putting it in the builder only meant

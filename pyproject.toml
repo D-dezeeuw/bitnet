@@ -1,4 +1,7 @@
 [tool.pytest.ini_options]
+# app.py sits at the repo root. Without this, `pytest` only finds it when
+# invoked as `python -m pytest`, which happens to put CWD on sys.path.
+pythonpath = ["."]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
