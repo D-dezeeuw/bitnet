@@ -5,4 +5,13 @@
 fastapi==0.115.12
 uvicorn==0.34.0
 httpx==0.28.1
-pydantic==2.11.1
+pydantic==2.13.4
+
+# MCP server for the /mcp endpoint, so Claude Desktop and other MCP clients can
+# use this model as a tool. Pulls in starlette and sse-starlette; starlette is
+# pinned explicitly because mcp accepts >=0.27 while fastapi 0.115 requires
+# <0.47, and an unpinned resolve can land outside that window.
+mcp==2.0.0
+starlette==0.46.2
+
+# pydantic is 2.13 rather than 2.11 because mcp 2.0 requires >=2.12.
