@@ -72,10 +72,21 @@ RUN cmake --build build --config Release -j"$(nproc)" --target llama-server llam
     && test -f build/bin/llama-server \
     && test -f build/bin/llama-cli
 
-# Collect shared libraries -- wildcards catch versioned names (libllama.so.1).
+# Collect every shared library the build produced, rather than naming them.
+# An earlier version globbed "libllama.so*" and "libggml*.so*", which silently
+# missed libllama-common.so.0, libllama-server-impl.so and libmtmd.so.0 -- the
+# first two because the prefix is "libllama-", not "libllama.", and the third
+# because it shares no prefix at all. Upstream splits and renames these targets,
+# so any hand-maintained list drifts. The ldd check in the runtime stage is what
+# actually verifies the result.
+#
+# The two patterns cover unversioned (.so) and versioned (.so.0, .so.0.0.0)
+# names; symlinks are copied as symlinks by -a, and static .a archives are
+# excluded.
 RUN mkdir -p /build/collected_libs \
-    && find /build/build -name "libllama.so*" -exec cp -a {} /build/collected_libs/ \; \
-    && find /build/build -name "libggml*.so*" -exec cp -a {} /build/collected_libs/ \;
+    && find /build/build \( -name "*.so" -o -name "*.so.*" \) \
+         -exec cp -a {} /build/collected_libs/ \; \
+    && test -n "$(ls -A /build/collected_libs)"
 
 #
 # === Runtime stage ===
