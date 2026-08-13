@@ -171,3 +171,80 @@ async def test_summarize_returns_a_summary(client, backend):
     )
     assert resp.status_code == 200
     assert resp.json()["summary"] == "A tidy summary."
+
+
+class TestRepetitionPenalty:
+    """llama-server defaults repeat_penalty to 1.0 (disabled), which made the
+    model restate the same sentence until it hit n_predict. These pin the
+    penalty as always-sent rather than optional."""
+
+    async def test_penalty_is_always_sent(self, client, backend):
+        await client.post(
+            "/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]}
+        )
+        payload = backend.requests[-1]
+        assert payload["repeat_penalty"] == 1.1
+        assert payload["repeat_last_n"] == 64
+
+    async def test_penalty_is_never_the_disabling_default(self, client, backend):
+        """1.0 is the value that caused the looping; the default must not be it."""
+        await client.post(
+            "/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]}
+        )
+        assert backend.requests[-1]["repeat_penalty"] > 1.0
+
+    async def test_request_can_override_the_penalty(self, client, backend):
+        await client.post(
+            "/v1/chat/completions",
+            json={
+                "messages": [{"role": "user", "content": "hi"}],
+                "repeat_penalty": 1.3,
+                "repeat_last_n": 128,
+            },
+        )
+        assert backend.requests[-1]["repeat_penalty"] == 1.3
+        assert backend.requests[-1]["repeat_last_n"] == 128
+
+    async def test_caller_can_opt_out_with_one(self, client, backend):
+        """1.0 is a legitimate explicit choice even though it is a bad default."""
+        await client.post(
+            "/v1/chat/completions",
+            json={"messages": [{"role": "user", "content": "hi"}], "repeat_penalty": 1.0},
+        )
+        assert backend.requests[-1]["repeat_penalty"] == 1.0
+
+    async def test_settings_drive_the_default(
+        self, client, backend, settings, monkeypatch
+    ):
+        # monkeypatch, not direct assignment: settings is a singleton and a raw
+        # assignment here leaked 1.25 into every later test.
+        monkeypatch.setattr(settings, "repeat_penalty", 1.25)
+        await client.post(
+            "/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]}
+        )
+        assert backend.requests[-1]["repeat_penalty"] == 1.25
+
+    async def test_below_one_is_rejected(self, client):
+        """Under 1.0 rewards repetition, which is never what a caller wants."""
+        r = await client.post(
+            "/v1/chat/completions",
+            json={"messages": [{"role": "user", "content": "hi"}], "repeat_penalty": 0.5},
+        )
+        assert r.status_code == 422
+
+    async def test_mcp_tool_gets_the_penalty_too(
+        self, client, backend, settings, monkeypatch
+    ):
+        """The MCP path builds its payload through the same helper, so it must
+        inherit this rather than looping where the REST path does not."""
+        monkeypatch.setattr(settings, "api_key", "k")
+        init = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                           "clientInfo": {"name": "t", "version": "1"}}}
+        h = {"Content-Type": "application/json",
+             "Accept": "application/json, text/event-stream"}
+        await client.post("/mcp?key=k", json=init, headers=h)
+        await client.post("/mcp?key=k", headers=h, json={
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "bitnet_chat", "arguments": {"prompt": "hi"}}})
+        assert backend.requests[-1]["repeat_penalty"] == 1.1

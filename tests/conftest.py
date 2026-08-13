@@ -81,6 +81,11 @@ def settings(monkeypatch):
     monkeypatch.setattr(app_module.settings, "api_key", None)
     monkeypatch.setattr(app_module.settings, "queue_timeout", 0.2)
     monkeypatch.setattr(app_module.settings, "role_stop_fallback", False)
+    # Reset the sampler defaults too. settings is a module-level singleton, so a
+    # test that assigns to it directly rather than through monkeypatch leaks the
+    # value into every test that follows -- which is exactly what happened.
+    monkeypatch.setattr(app_module.settings, "repeat_penalty", 1.1)
+    monkeypatch.setattr(app_module.settings, "repeat_last_n", 64)
     return app_module.settings
 
 

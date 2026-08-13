@@ -75,6 +75,16 @@ class Settings:
         self.max_messages = int(os.environ.get("BITNET_MAX_MESSAGES", "200"))
         self.session_ttl = int(os.environ.get("BITNET_SESSION_TTL", "86400"))
 
+        # llama-server defaults repeat_penalty to 1.0, which is no penalty at
+        # all. A 2B model left unpenalised loops: observed output restated the
+        # same sentence until it hit n_predict instead of ending its turn.
+        # 1.1 is llama.cpp's own long-standing default and is the smallest value
+        # that reliably breaks that cycle; much above ~1.2 starts degrading
+        # fluency, since legitimate repetition (names, list items) is punished
+        # too. repeat_last_n is the window it applies over.
+        self.repeat_penalty = float(os.environ.get("BITNET_REPEAT_PENALTY", "1.1"))
+        self.repeat_last_n = int(os.environ.get("BITNET_REPEAT_LAST_N", "64"))
+
         # Pre-MDL-1 the prompt carried no turn separators, so generation had to
         # be stopped by string-matching "User:". That truncated any reply which
         # legitimately contained the string. The correct template makes
@@ -280,6 +290,12 @@ class ChatRequest(BaseModel):
     stop: list[str] | None = Field(default=None, max_length=4)
     presence_penalty: float | None = Field(default=None, ge=-2.0, le=2.0)
     frequency_penalty: float | None = Field(default=None, ge=-2.0, le=2.0)
+    # Distinct from frequency_penalty: that one is OpenAI's additive logit
+    # penalty, this is llama.cpp's multiplicative one, and the backend applies
+    # them independently. Left unset the server default applies; 1.0 disables
+    # it, which is what produced the looping this exists to stop.
+    repeat_penalty: float | None = Field(default=None, ge=1.0, le=2.0)
+    repeat_last_n: int | None = Field(default=None, ge=0, le=2048)
     # Resume the trailing assistant turn instead of opening a new one.
     continuation: bool = False
 
@@ -392,6 +408,19 @@ def backend_payload(req: ChatRequest) -> dict:
         "temperature": req.temperature,
         "stream": req.stream,
         "stop": resolve_stops(req.stop),
+        # Always sent, unlike the optional sampler fields below: omitting it
+        # means llama-server applies its own 1.0 default and the model loops.
+        # The per-request value wins so a caller can still opt out with 1.0.
+        "repeat_penalty": (
+            req.repeat_penalty
+            if req.repeat_penalty is not None
+            else settings.repeat_penalty
+        ),
+        "repeat_last_n": (
+            req.repeat_last_n
+            if req.repeat_last_n is not None
+            else settings.repeat_last_n
+        ),
     }
     if req.top_p is not None:
         payload["top_p"] = req.top_p
