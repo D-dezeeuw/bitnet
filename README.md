@@ -217,21 +217,61 @@ lookup-table kernels that are disabled here.
 
 ## Configuration
 
+Nothing has to be set: every variable below has a working default, and the
+defaults are a functioning deployment. Copy `.env.example` to `.env` and edit
+what you need.
+
+```bash
+cp .env.example .env
+```
+
+`start.sh` reads `.env` if it exists. The file is parsed rather than sourced, so
+it cannot execute code, and the shell environment takes precedence over it:
+
+```
+shell environment  >  .env  >  built-in default
+```
+
+So `BITNET_THREADS=8 ./start.sh` wins over whatever `.env` says. `.env` is
+gitignored because it holds the API key; `.env.example` is tracked.
+
+**The one worth setting is `BITNET_API_KEY`.** Without it every `/v1` route is
+open to anything that can reach the container on the proxy network.
+
+### Container settings
+
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `BITNET_API_KEY` | _(unset)_ | Require this key on `/v1` routes. Unset means open. |
 | `MODEL_PATH` | `/app/models/model.gguf` | Path to GGUF model |
 | `MODEL_ID` | `bitnet-b1.58-2B-4T` | Model ID returned by the API |
-| `LLAMA_SERVER_PORT` | `8080` | Internal llama-server port |
+| `BITNET_API_PORT` | `8010` | Port the API listens on |
+| `LLAMA_SERVER_PORT` | `8080` | Internal llama-server port, bound to `127.0.0.1` |
 | `BITNET_THREADS` | `4` | Inference threads (see note below) |
 | `BITNET_CTX_SIZE` | `4096` | Context window size, served to the UI via `/v1/status` |
 | `BITNET_QUEUE_TIMEOUT` | `3` | Seconds to wait for the inference slot before `503` |
 | `BITNET_READ_TIMEOUT` | `900` | Backend read timeout for non-streaming requests |
+| `BITNET_CONNECT_TIMEOUT` | `5` | Backend connect timeout |
+| `BITNET_STARTUP_TIMEOUT` | `120` | Seconds to wait for llama-server before giving up |
 | `BITNET_MAX_MESSAGES` | `200` | Maximum messages per request |
 | `BITNET_SESSION_TTL` | `86400` | UI session cookie lifetime in seconds |
 | `BITNET_ROLE_STOP_FALLBACK` | `0` | Re-enable legacy `"User:"` string stops |
 | `BITNET_TRUSTED_PROXIES` | `127.0.0.1` | Hosts allowed to set `X-Forwarded-For` |
+| `BITNET_STATIC_DIR` | `/app/static` | Directory the web UI is served from |
 | `BITNET_DOWNLOAD_PATH` | `/app/downloads/download.zip` | File served by `/download` |
+
+### Deployment settings
+
+Read by `start.sh` only. These govern `docker run` and are not passed into the
+container.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `NETWORK` | `nginx-proxy-manager_default` | External docker network to join |
+| `STATIC_IP` | `172.22.0.25` | Address to take on that network |
+| `HOST_PORT` | _(unset)_ | Also publish on this host port; unset means proxy-only |
+| `IMAGE` | `bitnet-2b-api` | Image tag to build |
+| `CONTAINER` | `bitnet-2b` | Container name |
 
 `BITNET_THREADS` defaults to 4, which is a conservative guess rather than a
 measured value; upstream benchmarks x86 at 8 threads. Measure on the deployment
@@ -271,8 +311,24 @@ the model in the build context.
 
 ## Network
 
-The container joins `nginx-proxy-manager_default` with static IP `172.22.0.25`.
-Reverse proxy to port 8010 over HTTP (not HTTPS).
+By default the container joins `nginx-proxy-manager_default` and takes static IP
+`172.22.0.25`, serving on port 8010. Point the proxy host at `172.22.0.25:8010`
+over HTTP, not HTTPS — TLS terminates at the proxy.
+
+All three are configurable: `NETWORK`, `STATIC_IP`, and `BITNET_API_PORT`. The
+network and address are `docker run` arguments, so they live in `start.sh` and
+cannot be set from the Dockerfile; the port is a container setting and can be.
+
+The network is treated as a precondition rather than created on demand — it
+belongs to the nginx-proxy-manager stack, and creating it here with the wrong
+subnet would leave the proxy unable to route to this container. `start.sh`
+checks before building that the network exists and has a configured subnet
+(without one, docker cannot honour `--ip`), and after starting that the
+container actually holds `STATIC_IP`. If the network is missing:
+
+```bash
+docker network create --subnet 172.22.0.0/16 nginx-proxy-manager_default
+```
 
 Because no host port is published by default, `localhost:8010` will not reach
 it. Use `HOST_PORT=8010 ./start.sh` for local testing, or exec into the

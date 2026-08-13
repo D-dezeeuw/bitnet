@@ -1,10 +1,38 @@
 #!/bin/bash
 set -euo pipefail
 
+# Load .env if present. Values act as defaults: anything already exported wins,
+# so `BITNET_THREADS=8 ./start.sh` still overrides the file.
+#
+# The file is parsed, not sourced. Sourcing would execute whatever it contains,
+# and this file holds the API key -- a config file should not be a shell script.
+if [ -f .env ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line#"${line%%[![:space:]]*}"}"        # strip leading whitespace
+    case "$line" in ''|'#'*) continue ;; esac
+    case "$line" in *=*) ;; *) continue ;; esac
+    key="${line%%=*}"
+    val="${line#*=}"
+    key="${key#export }"
+    key="${key%"${key##*[![:space:]]}"}"           # strip trailing whitespace
+    # A regex, not a case glob: in glob syntax `[A-Za-z0-9_]*` is a single
+    # character class followed by a wildcard, so it accepts "BAD-KEY" and the
+    # export below then fails and takes the whole script down under `set -e`.
+    [[ $key =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    case "$val" in                                 # strip matched quotes
+      \"*\") val="${val#\"}"; val="${val%\"}" ;;
+      \'*\') val="${val#\'}"; val="${val%\'}" ;;
+    esac
+    [ -n "${!key+set}" ] || export "$key=$val"
+  done < .env
+  echo "Loaded configuration from .env"
+fi
+
 IMAGE="${IMAGE:-bitnet-2b-api}"
 CONTAINER="${CONTAINER:-bitnet-2b}"
 NETWORK="${NETWORK:-nginx-proxy-manager_default}"
 STATIC_IP="${STATIC_IP:-172.22.0.25}"
+API_PORT="${BITNET_API_PORT:-8010}"
 MODEL_FILE="ggml-model-i2_s.gguf"
 # Pinned for the same reason the upstream source is: the HF repo is a moving
 # target (last updated 2025-12-17, well after its April 2025 release), so an
@@ -41,6 +69,30 @@ if command -v sha256sum > /dev/null 2>&1; then
   fi
 fi
 
+# The network is created by another stack (nginx-proxy-manager's compose file),
+# so it is a precondition here, not something to create silently -- creating it
+# with the wrong subnet would leave the proxy unable to reach this container.
+if ! docker network inspect "$NETWORK" > /dev/null 2>&1; then
+  echo "ERROR: docker network '$NETWORK' does not exist." >&2
+  echo "It normally comes from the nginx-proxy-manager stack; start that first." >&2
+  echo "To create it manually:" >&2
+  echo "  docker network create --subnet 172.22.0.0/16 $NETWORK" >&2
+  exit 1
+fi
+
+# --ip only works on a network with an explicit IPAM subnet. Without one docker
+# fails with "user specified IP address is supported only when connecting to
+# networks with user configured subnets", which does not say what to do.
+SUBNETS="$(docker network inspect -f \
+  '{{range .IPAM.Config}}{{.Subnet}} {{end}}' "$NETWORK" 2>/dev/null | tr -s ' ')"
+if [ -z "${SUBNETS// /}" ]; then
+  echo "ERROR: network '$NETWORK' has no configured subnet, so the static IP" >&2
+  echo "$STATIC_IP cannot be assigned. Recreate it with an explicit --subnet," >&2
+  echo "or unset STATIC_IP to let docker assign an address." >&2
+  exit 1
+fi
+echo "Network $NETWORK found (subnet: ${SUBNETS% })"
+
 echo "Building BitNet 2B Docker image..."
 docker build -t "$IMAGE" .
 
@@ -56,11 +108,26 @@ RUN_ARGS=(
 # Authentication is off unless a key is supplied. Without one every /v1 route
 # is open to anything that can reach the container.
 if [ -n "${BITNET_API_KEY:-}" ]; then
-  RUN_ARGS+=(-e "BITNET_API_KEY=${BITNET_API_KEY}")
   echo "API key authentication: ENABLED"
 else
   echo "API key authentication: DISABLED (set BITNET_API_KEY to require one)"
 fi
+
+# Forward configuration into the container. Only variables the container reads
+# are passed: IMAGE/CONTAINER/NETWORK/STATIC_IP/HOST_PORT govern `docker run`
+# itself and mean nothing inside. Unset variables are skipped so the image's own
+# ENV defaults apply rather than being overridden with an empty string.
+for var in \
+  BITNET_API_KEY BITNET_THREADS BITNET_CTX_SIZE BITNET_QUEUE_TIMEOUT \
+  BITNET_READ_TIMEOUT BITNET_CONNECT_TIMEOUT BITNET_MAX_MESSAGES \
+  BITNET_SESSION_TTL BITNET_ROLE_STOP_FALLBACK BITNET_TRUSTED_PROXIES \
+  BITNET_STARTUP_TIMEOUT BITNET_API_PORT BITNET_STATIC_DIR \
+  BITNET_DOWNLOAD_PATH MODEL_ID LLAMA_SERVER_PORT
+do
+  if [ -n "${!var:-}" ]; then
+    RUN_ARGS+=(-e "$var=${!var}")
+  fi
+done
 
 # /download is served from a mount, so download.zip is optional and never a
 # build dependency. The route returns 404 when nothing is mounted.
@@ -70,16 +137,32 @@ if [ -f "download.zip" ]; then
 fi
 
 if [ -n "$HOST_PORT" ]; then
-  RUN_ARGS+=(-p "${HOST_PORT}:8010")
+  RUN_ARGS+=(-p "${HOST_PORT}:${API_PORT}")
 fi
 
 echo "Starting BitNet 2B container..."
 docker run -d "${RUN_ARGS[@]}" "$IMAGE"
 
+# Confirm the address was actually taken. `docker run --ip` fails loudly on a
+# conflict, but a container that exits immediately also leaves no address, and
+# that is worth catching here rather than when the proxy 502s.
+ACTUAL_IP="$(docker inspect -f \
+  "{{with index .NetworkSettings.Networks \"$NETWORK\"}}{{.IPAddress}}{{end}}" \
+  "$CONTAINER" 2>/dev/null || true)"
+if [ "$ACTUAL_IP" != "$STATIC_IP" ]; then
+  echo "ERROR: expected the container at $STATIC_IP on $NETWORK," >&2
+  echo "but it reports '${ACTUAL_IP:-no address}'. Container logs:" >&2
+  docker logs --tail 20 "$CONTAINER" >&2 2>/dev/null || true
+  exit 1
+fi
+
 cat <<EOF
 
 BitNet 2B API running on network $NETWORK
-Internal: http://$CONTAINER:8010
+Internal: http://$CONTAINER:$API_PORT
+Static IP: http://$STATIC_IP:$API_PORT  (confirmed assigned)
+
+Point the nginx-proxy-manager host at $STATIC_IP port $API_PORT.
 
 EOF
 
@@ -96,9 +179,15 @@ EOF
 else
   cat <<EOF
 No host port published, so localhost will not reach it. Test from inside the
-container, or re-run with HOST_PORT=8010 ./start.sh
+container, or re-run with HOST_PORT=${API_PORT} ./start.sh
 
-  docker exec $CONTAINER curl -s http://127.0.0.1:8010/health
-  docker exec $CONTAINER curl -s http://127.0.0.1:8010/v1/models
+  docker exec $CONTAINER curl -s http://127.0.0.1:${API_PORT}/health
+  docker exec $CONTAINER curl -s http://127.0.0.1:${API_PORT}/v1/models
 EOF
 fi
+
+cat <<EOF
+
+The model loads before the API answers; give it a minute or two on first start.
+Follow it with: docker logs -f $CONTAINER
+EOF
