@@ -7,6 +7,7 @@ construction that matches what the model was actually trained on.
 """
 
 import asyncio
+import contextlib
 import hashlib
 import hmac
 import json
@@ -24,7 +25,10 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from mcp.server.transport_security import TransportSecuritySettings
+from pydantic import BaseModel, Field, ValidationError
+
+from mcp_server import MCPDispatch, build_mcp_server
 
 logging.basicConfig(
     stream=sys.stdout,
@@ -108,6 +112,10 @@ SESSION_COOKIE = "bitnet_session"
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Connecting to llama-server at %s", settings.llama_url)
+    if settings.api_key:
+        logger.info("MCP endpoint enabled at /mcp")
+    else:
+        logger.warning("MCP endpoint disabled: it requires BITNET_API_KEY")
     logger.info(
         "ctx=%d max_tokens_cap=%d auth=%s",
         settings.ctx_size,
@@ -131,8 +139,46 @@ async def lifespan(app: FastAPI):
             pool=30.0,
         ),
     )
-    yield
-    await app.state.client.aclose()
+    # Built per-lifespan, not once at import. A StreamableHTTPSessionManager
+    # refuses a second .run(), so a module-level instance works in production
+    # (one lifespan) but breaks the moment anything starts the app twice in a
+    # process -- which the test suite does for every test.
+    #
+    # A mounted sub-application's lifespan never runs, so .run() has to be
+    # entered here or the first /mcp request fails on a missing task group.
+    mcp_server = build_mcp_server(_mcp_generate, _mcp_status)
+    app.state.mcp_asgi = mcp_server.streamable_http_app(
+        streamable_http_path="/",
+        json_response=True,
+        stateless_http=True,
+        transport_security=TransportSecuritySettings(
+            enable_dns_rebinding_protection=False
+        ),
+    )
+    # The session manager is an anyio task group, which must be entered and
+    # exited from the same task. Holding it open across `yield` here would not
+    # be: ASGI startup and shutdown can run in different tasks, which surfaces
+    # as "Attempted to exit cancel scope in a different task". Giving it a
+    # dedicated task that owns the whole `async with` keeps both ends together,
+    # and cancelling that task is what closes it.
+    started = asyncio.Event()
+
+    async def _run_session_manager() -> None:
+        async with mcp_server.session_manager.run():
+            started.set()
+            await asyncio.Event().wait()  # until cancelled at shutdown
+
+    manager_task = asyncio.create_task(_run_session_manager())
+    await started.wait()
+
+    try:
+        yield
+    finally:
+        manager_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await manager_task
+        app.state.mcp_asgi = None
+        await app.state.client.aclose()
 
 
 app = FastAPI(title="BitNet API", lifespan=lifespan, docs_url=None, redoc_url=None)
@@ -645,3 +691,92 @@ if settings.static_dir.is_dir():
     app.mount("/static", StaticFiles(directory=settings.static_dir), name="static")
 else:  # pragma: no cover - only hit in a misconfigured deployment
     logger.warning("Static directory %s missing; /inference will 404", settings.static_dir)
+
+
+# --------------------------------------------------------------------------
+# MCP endpoint
+#
+# MCP clients (Claude Desktop's connectors, among others) cannot consume
+# /v1/chat/completions: a connector is an MCP server providing tools, not an
+# OpenAI-compatible chat endpoint. /mcp wraps the same inference path in the
+# protocol those clients speak.
+# --------------------------------------------------------------------------
+
+
+async def _mcp_generate(
+    prompt: str, system: str | None, max_tokens: int, temperature: float
+) -> dict:
+    """Run one non-streaming completion for an MCP tool call.
+
+    Goes through ChatRequest and backend_payload rather than talking to the
+    backend directly, so the prompt template, stop tokens and validation stay
+    identical to /v1/chat/completions. A second construction path here is
+    exactly how the prompt format drifted before.
+    """
+    messages = []
+    if system:
+        messages.append(Message(role="system", content=system))
+    messages.append(Message(role="user", content=prompt))
+
+    try:
+        req = ChatRequest(
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            stream=False,
+        )
+    except ValidationError as exc:
+        # Surface the constraint rather than a pydantic dump: the caller is a
+        # model deciding what to do next, and "max_tokens must be 1..4096" is
+        # actionable where a traceback is not.
+        raise ValueError(f"Invalid arguments: {exc.errors()[0]['msg']}") from exc
+
+    validate_budget(req.messages, req.max_tokens)
+    payload = backend_payload(req)
+
+    slot = await acquire_slot(app.state.inference_lock)
+    try:
+        try:
+            resp = await app.state.client.post("/completion", json=payload)
+            resp.raise_for_status()
+        except (httpx.HTTPStatusError, httpx.RequestError) as exc:
+            raise ValueError(f"BitNet backend unavailable: {exc}") from exc
+        data = resp.json()
+    finally:
+        slot.release()
+
+    return {
+        "content": data.get("content", ""),
+        "finish_reason": "length" if data.get("stopped_limit", False) else "stop",
+    }
+
+
+async def _mcp_status() -> dict:
+    try:
+        resp = await app.state.client.get("/health", timeout=5.0)
+        backend = "ok" if resp.status_code == 200 else "degraded"
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("MCP status check failed: %s", exc)
+        backend = "unavailable"
+    return {
+        "backend": backend,
+        "model": settings.model_id,
+        "context_size": settings.ctx_size,
+        "max_tokens_cap": settings.max_tokens_cap,
+        "busy": app.state.inference_lock.locked(),
+    }
+
+
+# Both the target app and the key are resolved per request: lifespan rebuilds
+# the former, and the latter is read from settings so tests (and anything that
+# reconfigures at runtime) are not stuck with an import-time snapshot.
+#
+# The MCP app itself is built with stateless_http (no per-client state worth
+# keeping, and a stateless endpoint survives a restart mid-conversation) and
+# json_response (every tool returns a single result with no interim progress,
+# and plain JSON passes through reverse proxies that buffer SSE).
+app.add_middleware(
+    MCPDispatch,
+    get_target=lambda: getattr(app.state, "mcp_asgi", None),
+    get_api_key=lambda: settings.api_key,
+)

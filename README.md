@@ -307,7 +307,56 @@ the model in the build context.
 | `static/` | Web UI (HTML, CSS, JS, vendored libraries) |
 | `entrypoint.sh` | Container startup and process supervision |
 | `requirements.txt` | Runtime dependencies |
+| `mcp_server.py` | MCP tools and the `/mcp` auth wrapper |
 | `tests/` | Test suite, run against a stubbed backend |
+
+## MCP endpoint (Claude Desktop and other MCP clients)
+
+`/mcp` exposes this model as MCP tools, so MCP clients can call it.
+
+This is a separate protocol from `/v1/chat/completions`, not an alias for it.
+An MCP connector gives a client *tools*; it does not supply a model. Pasting
+the OpenAI-compatible URL into a connector dialog cannot work, because nothing
+at that address speaks MCP. Use `/mcp` for MCP clients and `/v1` for
+OpenAI-compatible clients.
+
+Set `BITNET_API_KEY`, then use:
+
+```
+https://your-host/mcp?key=<BITNET_API_KEY>
+```
+
+In Claude Desktop that goes in Settings → Connectors → Add custom connector.
+
+### Tools
+
+| Tool | Purpose |
+|------|---------|
+| `bitnet_chat` | Send a prompt, get a reply. Optional `system`, `max_tokens`, `temperature`. |
+| `bitnet_status` | Backend reachability, model id, context size, whether the slot is busy. |
+
+`bitnet_chat` goes through the same `ChatRequest` and prompt builder as
+`/v1/chat/completions`, so the template and stop tokens cannot drift between
+the two paths. It shares the single inference slot: a call made while the slot
+is busy fails with a busy error rather than queueing, and a reply cut short by
+`max_tokens` is labelled as truncated instead of being returned as if complete.
+
+### The key in the URL
+
+The key is accepted as a `?key=` query parameter because a connector dialog
+accepts a URL and offers no way to attach an `Authorization` header. An
+`Authorization: Bearer <key>` header also works, and is better wherever the
+client can send one.
+
+A key in a URL is genuinely weaker than one in a header: it appears in reverse
+proxy access logs, in shell history, and in any error report that echoes the
+request line, and nothing that redacts `Authorization` will redact it. Treat
+the URL as the secret it contains, and rotate the key if it leaks.
+
+`/mcp` returns `503` unless `BITNET_API_KEY` is set. It fails closed rather
+than open because an unauthenticated MCP endpoint on a public host lets anyone
+spend the one inference slot. The `/v1` routes keep their existing behaviour of
+serving without a key.
 
 ## Network
 
