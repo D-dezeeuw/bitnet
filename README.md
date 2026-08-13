@@ -249,6 +249,8 @@ open to anything that can reach the container on the proxy network.
 | `LLAMA_SERVER_PORT` | `8080` | Internal llama-server port, bound to `127.0.0.1` |
 | `BITNET_THREADS` | `4` | Inference threads (see note below) |
 | `BITNET_CTX_SIZE` | `4096` | Context window size, served to the UI via `/v1/status` |
+| `BITNET_REPEAT_PENALTY` | `1.1` | Repetition penalty (see note below) |
+| `BITNET_REPEAT_LAST_N` | `64` | Token window the penalty applies over |
 | `BITNET_QUEUE_TIMEOUT` | `3` | Seconds to wait for the inference slot before `503` |
 | `BITNET_READ_TIMEOUT` | `900` | Backend read timeout for non-streaming requests |
 | `BITNET_CONNECT_TIMEOUT` | `5` | Backend connect timeout |
@@ -272,6 +274,14 @@ container.
 | `HOST_PORT` | _(unset)_ | Also publish on this host port; unset means proxy-only |
 | `IMAGE` | `bitnet-2b-api` | Image tag to build |
 | `CONTAINER` | `bitnet-2b` | Container name |
+
+`BITNET_REPEAT_PENALTY` is sent on every request rather than left to the
+backend. llama-server's own default is `1.0`, which is no penalty at all, and an
+unpenalised 2B model loops — observed output restated the same sentence until it
+hit `n_predict` instead of ending its turn. `1.1` is llama.cpp's long-standing
+default and the smallest value that reliably breaks the cycle. Going much above
+`1.2` starts costing fluency, because legitimate repetition (names, list items,
+code) gets punished too. A request may override it, including back to `1.0`.
 
 `BITNET_THREADS` defaults to 4, which is a conservative guess rather than a
 measured value; upstream benchmarks x86 at 8 threads. Measure on the deployment
