@@ -75,14 +75,14 @@ class Settings:
         self.max_messages = int(os.environ.get("BITNET_MAX_MESSAGES", "200"))
         self.session_ttl = int(os.environ.get("BITNET_SESSION_TTL", "86400"))
 
-        # llama-server defaults repeat_penalty to 1.0, which is no penalty at
-        # all. A 2B model left unpenalised loops: observed output restated the
-        # same sentence until it hit n_predict instead of ending its turn.
-        # 1.1 is llama.cpp's own long-standing default and is the smallest value
-        # that reliably breaks that cycle; much above ~1.2 starts degrading
-        # fluency, since legitimate repetition (names, list items) is punished
-        # too. repeat_last_n is the window it applies over.
-        self.repeat_penalty = float(os.environ.get("BITNET_REPEAT_PENALTY", "1.1"))
+        # Off by default, after briefly being 1.1. It penalises every token in
+        # the window, including the function words and subject nouns a sentence
+        # structurally needs, so on a 2B model it does not so much suppress
+        # repetition as force lower-probability substitutes: output degraded
+        # into "strings aren't be taken" and "then is won't show". DRY below
+        # handles the phrase-level repetition this was reaching for, without
+        # touching individual words. Raise it only if DRY proves insufficient.
+        self.repeat_penalty = float(os.environ.get("BITNET_REPEAT_PENALTY", "1.0"))
         self.repeat_last_n = int(os.environ.get("BITNET_REPEAT_LAST_N", "64"))
 
         # DRY sampling. repeat_penalty acts on single tokens in a window, which
@@ -96,6 +96,25 @@ class Settings:
         self.dry_multiplier = float(os.environ.get("BITNET_DRY_MULTIPLIER", "0.8"))
         self.dry_base = float(os.environ.get("BITNET_DRY_BASE", "1.75"))
         self.dry_allowed_length = int(os.environ.get("BITNET_DRY_ALLOWED_LENGTH", "2"))
+
+        # Sampling is deliberately conservative. 1.58-bit quantisation has
+        # already blurred the model's probability distribution, so a temperature
+        # that reads as merely lively on a large model is destructive here --
+        # every coherent reply observed came from temperature 0, every rambling
+        # one from 0.7. min_p truncates the tail by relative probability, which
+        # holds up better than top_p when the distribution is this flat.
+        self.temperature = float(os.environ.get("BITNET_TEMPERATURE", "0.3"))
+        self.min_p = float(os.environ.get("BITNET_MIN_P", "0.1"))
+
+        # Prepended when a caller sends no system message. Without any framing
+        # the model drifts into free association rather than answering; small
+        # instruct models lean on a system turn to stay anchored. Set empty to
+        # send nothing.
+        self.system_prompt = os.environ.get(
+            "BITNET_SYSTEM_PROMPT",
+            "You are a helpful assistant. Answer accurately and concisely. "
+            "If you do not know something, say so rather than guessing.",
+        ).strip()
 
         # Pre-MDL-1 the prompt carried no turn separators, so generation had to
         # be stopped by string-matching "User:". That truncated any reply which
@@ -347,7 +366,10 @@ class ChatRequest(BaseModel):
     model: str | None = None
     messages: list[Message] = Field(min_length=1, max_length=settings.max_messages)
     max_tokens: int = Field(default=256, ge=1, le=settings.max_tokens_cap)
-    temperature: float = Field(default=0.7, ge=0.0, le=2.0)
+    # Defaults to the configured value rather than a literal, so the server-wide
+    # setting is what a caller who says nothing actually gets.
+    temperature: float = Field(default=settings.temperature, ge=0.0, le=2.0)
+    min_p: float | None = Field(default=None, ge=0.0, le=1.0)
     stream: bool = False
     top_p: float | None = Field(default=None, gt=0.0, le=1.0)
     n: int | None = Field(default=None, ge=1)
@@ -398,6 +420,33 @@ def build_prompt(messages: list[Message], *, continuation: bool = False) -> str:
         return head + GENERATION_PROMPT + messages[-1].content.lstrip()
     body = "".join(f"{m.role.capitalize()}: {m.content.strip()}{EOT}" for m in messages)
     return body + GENERATION_PROMPT
+
+
+def with_default_system(messages: list[Message], max_tokens: int) -> list[Message]:
+    """Prepend the configured system prompt when the caller supplied none.
+
+    Applied before budget validation, not inside build_prompt, so the added
+    characters are counted against the context like any other message rather
+    than slipping in after the check meant to bound them.
+
+    Skipped when it would not fit. The prompt is an improvement, not a
+    requirement, and silently injecting it into a request that was already at
+    the context limit would turn a working call into a 400 -- at
+    max_tokens == ctx_size the budget is a few characters, so any system prompt
+    overflows it. The caller's own content always takes priority.
+
+    A caller's own system message also wins: this fills a gap, it does not
+    override intent.
+    """
+    if not settings.system_prompt:
+        return messages
+    if any(m.role == "system" for m in messages):
+        return messages
+    candidate = [Message(role="system", content=settings.system_prompt), *messages]
+    if sum(len(m.content) for m in candidate) > prompt_budget_chars(max_tokens):
+        logger.debug("Default system prompt skipped: no room in the budget")
+        return messages
+    return candidate
 
 
 def prompt_budget_chars(max_tokens: int) -> int:
@@ -505,6 +554,10 @@ def backend_payload(req: ChatRequest) -> dict:
         # -1 means "consider the whole context" -- a loop that starts early must
         # still be penalised once generation is well past it.
         "dry_penalty_last_n": -1,
+        # Sent always for the same reason as the penalties: the useful value is
+        # not the backend's default. min_p keeps tokens by relative probability,
+        # which degrades more gracefully than top_p on a flat distribution.
+        "min_p": req.min_p if req.min_p is not None else settings.min_p,
     }
     if req.top_p is not None:
         payload["top_p"] = req.top_p
@@ -562,6 +615,7 @@ async def chat_completion(req: ChatRequest, request: Request):
         raise HTTPException(
             status_code=400, detail="Only n=1 is supported by this server"
         )
+    req.messages = with_default_system(req.messages, req.max_tokens)
     validate_budget(req.messages, req.max_tokens)
 
     payload = backend_payload(req)
@@ -861,6 +915,8 @@ async def _mcp_generate(
     if system:
         messages.append(Message(role="system", content=system))
     messages.append(Message(role="user", content=prompt))
+    # Same framing the REST path gets; a system argument from the caller wins.
+    messages = with_default_system(messages, max_tokens)
 
     try:
         req = ChatRequest(

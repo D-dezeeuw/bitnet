@@ -250,9 +250,12 @@ open to anything that can reach the container on the proxy network.
 | `LLAMA_SERVER_PORT` | `8080` | Internal llama-server port, bound to `127.0.0.1` |
 | `BITNET_THREADS` | `4` | Inference threads (see note below) |
 | `BITNET_CTX_SIZE` | `4096` | Context window size, served to the UI via `/v1/status` |
-| `BITNET_REPEAT_PENALTY` | `1.1` | Repetition penalty (see note below) |
+| `BITNET_REPEAT_PENALTY` | `1.0` | Token repetition penalty; off by default (see below) |
 | `BITNET_REPEAT_LAST_N` | `64` | Token window the penalty applies over |
 | `BITNET_DRY_MULTIPLIER` | `0.8` | DRY n-gram repetition penalty; `0` disables |
+| `BITNET_TEMPERATURE` | `0.3` | Default sampling temperature |
+| `BITNET_MIN_P` | `0.1` | Minimum relative token probability |
+| `BITNET_SYSTEM_PROMPT` | _(see below)_ | Prepended when the caller sends none; empty disables |
 | `BITNET_DRY_BASE` | `1.75` | DRY growth base |
 | `BITNET_DRY_ALLOWED_LENGTH` | `2` | N-gram length DRY tolerates before penalising |
 | `BITNET_QUEUE_TIMEOUT` | `3` | Seconds to wait for the inference slot before `503` |
@@ -287,21 +290,41 @@ default and the smallest value that reliably breaks the cycle. Going much above
 `1.2` starts costing fluency, because legitimate repetition (names, list items,
 code) gets punished too. A request may override it, including back to `1.0`.
 
-Two anti-repetition samplers are sent on every request, because llama-server
-disables both by default and this model loops badly without them. They address
-different failures and are not interchangeable:
+### Output quality
 
-- **`repeat_penalty`** acts on individual tokens in a sliding window. It stops
-  a single token being emitted over and over.
-- **`dry_multiplier`** (DRY) penalises repeated *n-grams*. This is the one that
-  matters here: the observed failure was a phrase cycling with substitutions
-  ("let's make it simple / easy / clear for you"), which a token-level penalty
-  barely touches because each variant differs by a word.
+This model needs a conservative decoding setup. 1.58-bit quantisation blurs the
+probability distribution, so settings that read as merely lively on a large
+model are destructive here. Three defaults exist because of specific observed
+failures, and all are overridable per request:
 
-`dry_penalty_last_n` is fixed at `-1` so DRY considers the whole context: a loop
-that starts early must still be penalised late in a long generation. Set
-`BITNET_DRY_MULTIPLIER=0` to turn DRY off, or override either sampler per
-request.
+**Temperature `0.3`, `min_p` `0.1`.** Every coherent reply observed came from
+temperature 0, every rambling one from 0.7. `min_p` keeps tokens by relative
+probability, which degrades more gracefully than `top_p` on a flat
+distribution. The web UI defaults to the same 0.3.
+
+**DRY on (`0.8`), `repeat_penalty` off (`1.0`).** Both are sent explicitly
+because llama-server disables both, and this model loops badly left alone. They
+are not interchangeable:
+
+- `dry_multiplier` penalises repeated *n-grams*. This is the one that works
+  here — the failure was a phrase cycling with substitutions ("let's make it
+  simple / easy / clear for you").
+- `repeat_penalty` penalises *individual tokens* in a window. Setting it to 1.1
+  made things worse, not better: it suppresses the function words and subject
+  nouns a sentence structurally needs, and output degraded into "strings aren't
+  be taken" and "then is won't show". It is off unless you have a reason.
+
+`dry_penalty_last_n` is fixed at `-1` so DRY sees the whole context; a loop that
+starts early must still be penalised late.
+
+**A default system prompt.** With no framing at all the model drifts into free
+association instead of answering. A caller's own `system` message always wins,
+and the default is skipped when it would not fit the remaining context budget —
+it is an improvement, not a reason to reject a request that was already at the
+limit. Set `BITNET_SYSTEM_PROMPT=""` to send nothing.
+
+None of this makes a 2B model good at hard questions; it stops the output being
+*broken* rather than merely limited.
 
 `BITNET_THREADS` defaults to 4, which is a conservative guess rather than a
 measured value; upstream benchmarks x86 at 8 threads. Measure on the deployment
