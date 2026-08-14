@@ -463,6 +463,27 @@ def backend_payload(req: ChatRequest) -> dict:
     return payload
 
 
+def finish_reason_from(data: dict) -> Literal["length", "stop"]:
+    """Map a llama-server result onto an OpenAI finish_reason.
+
+    Reads both spellings on purpose. Older llama.cpp reports the boolean
+    `stopped_limit`; newer versions replaced it with `stop_type`, one of
+    "limit" / "eos" / "word". Which one bitnet.cpp's fork emits depends on the
+    llama.cpp revision it vendors, and reading only the old name meant a reply
+    truncated at max_tokens was reported as a clean "stop" -- observed in
+    production, where a 120-token cap returned exactly 120 tokens, cut
+    mid-sentence, labelled "stop".
+
+    That mattered beyond cosmetics: the UI's Continue button and the MCP tool's
+    truncation notice both key off this, so neither fired when they should.
+    """
+    if data.get("stop_type") == "limit":
+        return "length"
+    if data.get("stopped_limit", False):
+        return "length"
+    return "stop"
+
+
 def _backend_error(exc: Exception) -> HTTPException:
     if isinstance(exc, httpx.HTTPStatusError):
         logger.error(
@@ -524,7 +545,7 @@ async def chat_completion(req: ChatRequest, request: Request):
     tokens_predicted = data.get("tokens_predicted", 0)
     tokens_evaluated = data.get("tokens_evaluated", 0)
     # Report what actually happened rather than always claiming "stop".
-    finish_reason = "length" if data.get("stopped_limit", False) else "stop"
+    finish_reason = finish_reason_from(data)
     logger.info(
         "Chat response: %d chars in %dms (%s)",
         len(content),
@@ -580,9 +601,7 @@ async def stream_completion(
                 total += len(token)
                 finish_reason = None
                 if stop:
-                    finish_reason = (
-                        "length" if chunk.get("stopped_limit", False) else "stop"
-                    )
+                    finish_reason = finish_reason_from(chunk)
                 sse = {
                     "id": chat_id,
                     "object": "chat.completion.chunk",
@@ -820,7 +839,7 @@ async def _mcp_generate(
 
     return {
         "content": data.get("content", ""),
-        "finish_reason": "length" if data.get("stopped_limit", False) else "stop",
+        "finish_reason": finish_reason_from(data),
     }
 
 

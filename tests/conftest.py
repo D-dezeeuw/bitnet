@@ -27,11 +27,24 @@ class StubBackend:
         self.requests: list[dict] = []
         self.content = "Hello there"
         self.stopped_limit = False
+        # Which spelling of the stop reason to emit. Older llama.cpp sends the
+        # boolean stopped_limit, newer sends stop_type; bitnet.cpp's fork could
+        # vendor either. The stub emitted only the old one, so the suite passed
+        # while production always reported "stop" for a truncated reply.
+        self.stop_field = "both"
         self.tokens_predicted = 2
         self.tokens_evaluated = 5
         self.delay = 0.0
         self.status_code = 200
         self.unavailable = False
+
+    def _stop_fields(self) -> dict:
+        out: dict = {}
+        if self.stop_field in ("both", "stopped_limit"):
+            out["stopped_limit"] = self.stopped_limit
+        if self.stop_field in ("both", "stop_type"):
+            out["stop_type"] = "limit" if self.stopped_limit else "eos"
+        return out
 
     @property
     def last_prompt(self) -> str | None:
@@ -41,7 +54,7 @@ class StubBackend:
         for token in self.content.split(" "):
             chunk = {"content": token + " ", "stop": False}
             yield f"data: {json.dumps(chunk)}\n\n".encode()
-        final = {"content": "", "stop": True, "stopped_limit": self.stopped_limit}
+        final = {"content": "", "stop": True, **self._stop_fields()}
         yield f"data: {json.dumps(final)}\n\n".encode()
         yield b"data: [DONE]\n\n"
 
@@ -70,7 +83,7 @@ class StubBackend:
                 "content": self.content,
                 "tokens_predicted": self.tokens_predicted,
                 "tokens_evaluated": self.tokens_evaluated,
-                "stopped_limit": self.stopped_limit,
+                **self._stop_fields(),
             },
         )
 
