@@ -262,3 +262,93 @@ async def test_slot_is_released_after_a_backend_failure(client, keyed, backend):
     backend.unavailable = False
     r = await client.get("/v1/status")
     assert r.json()["busy"] is False
+
+
+# --------------------------------------------------------------------------
+# Failure isolation
+#
+# The MCP endpoint shares a process with the API: entrypoint.sh exits when
+# uvicorn does, so anything fatal here restart-loops the container and takes
+# /v1 and the UI down with it. These pin that /mcp can never do that.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_kill_switch_disables_mcp_but_not_the_api(
+    backend, settings, monkeypatch
+):
+    import httpx as _httpx
+
+    import app as app_module
+
+    monkeypatch.setattr(app_module.settings, "mcp_enabled", False)
+    monkeypatch.setattr(app_module.settings, "api_key", "k")
+    async with app_module.app.router.lifespan_context(app_module.app):
+        await app_module.app.state.client.aclose()
+        app_module.app.state.client = _httpx.AsyncClient(
+            transport=_httpx.MockTransport(backend.handler),
+            base_url="http://stub-backend",
+        )
+        transport = _httpx.ASGITransport(app=app_module.app)
+        async with _httpx.AsyncClient(
+            transport=transport, base_url="http://testserver"
+        ) as c:
+            # The API keeps working...
+            assert (await c.get("/health")).status_code == 200
+            # ...and /mcp reports unavailable rather than hanging or crashing.
+            r = await c.post(
+                "/mcp?key=k", json=initialize(), headers=MCP_HEADERS
+            )
+            assert r.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_api_starts_even_if_the_session_manager_never_does(
+    backend, settings, monkeypatch
+):
+    """A session manager that hangs must not block startup.
+
+    The previous code did `await started.wait()` unbounded, so a manager that
+    raised or stalled left uvicorn stuck in startup forever: no healthcheck, no
+    logs, just a restart loop.
+    """
+    import httpx as _httpx
+
+    import app as app_module
+
+    monkeypatch.setattr(app_module.settings, "api_key", "k")
+    monkeypatch.setattr(app_module, "MCP_STARTUP_TIMEOUT", 0.25)
+
+    import contextlib
+
+    class _StalledManager:
+        @contextlib.asynccontextmanager
+        async def run(self):
+            # A real async context manager that fails on entry, so this
+            # exercises the same path a genuinely broken session manager takes
+            # rather than tripping over a malformed test double.
+            raise RuntimeError("session manager exploded")
+            yield  # pragma: no cover - unreachable, marks this a generator
+
+    class _StalledServer:
+        session_manager = _StalledManager()
+
+        def streamable_http_app(self, **kw):
+            return None
+
+    monkeypatch.setattr(app_module, "build_mcp_server", lambda *a: _StalledServer())
+
+    async with app_module.app.router.lifespan_context(app_module.app):
+        await app_module.app.state.client.aclose()
+        app_module.app.state.client = _httpx.AsyncClient(
+            transport=_httpx.MockTransport(backend.handler),
+            base_url="http://stub-backend",
+        )
+        transport = _httpx.ASGITransport(app=app_module.app)
+        async with _httpx.AsyncClient(
+            transport=transport, base_url="http://testserver"
+        ) as c:
+            # Startup completed at all, which is the point.
+            assert (await c.get("/health")).status_code == 200
+            r = await c.post("/mcp?key=k", json=initialize(), headers=MCP_HEADERS)
+            assert r.status_code == 503

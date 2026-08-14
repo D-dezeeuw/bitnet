@@ -104,6 +104,13 @@ class Settings:
         # fallback if a model revision ever stops emitting it.
         self.role_stop_fallback = _env_flag("BITNET_ROLE_STOP_FALLBACK", False)
 
+        # Kill switch for the MCP endpoint. It shares a process with the API, so
+        # a fault there takes the whole container down with it -- entrypoint.sh
+        # exits when uvicorn does, and the restart policy then loops. Turning
+        # this off keeps /v1 and the UI serving while /mcp is investigated,
+        # rather than leaving a crash-looping container as the only option.
+        self.mcp_enabled = _env_flag("BITNET_MCP_ENABLED", True)
+
         self.static_dir = Path(os.environ.get("BITNET_STATIC_DIR", BASE_DIR / "static"))
         self.download_path = Path(
             os.environ.get("BITNET_DOWNLOAD_PATH", BASE_DIR / "downloads" / "download.zip")
@@ -130,13 +137,17 @@ ROLE_STOP_FALLBACK = ["User:", "user:"]
 
 SESSION_COOKIE = "bitnet_session"
 
+# How long startup waits for the MCP session manager before giving up on it and
+# serving without /mcp. Generous, because it only bounds a failure path.
+MCP_STARTUP_TIMEOUT = 30.0
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Connecting to llama-server at %s", settings.llama_url)
-    if settings.api_key:
-        logger.info("MCP endpoint enabled at /mcp")
-    else:
+    if not settings.mcp_enabled:
+        logger.warning("MCP endpoint disabled by BITNET_MCP_ENABLED")
+    elif not settings.api_key:
         logger.warning("MCP endpoint disabled: it requires BITNET_API_KEY")
     logger.info(
         "ctx=%d max_tokens_cap=%d auth=%s",
@@ -168,37 +179,78 @@ async def lifespan(app: FastAPI):
     #
     # A mounted sub-application's lifespan never runs, so .run() has to be
     # entered here or the first /mcp request fails on a missing task group.
-    mcp_server = build_mcp_server(_mcp_generate, _mcp_status)
-    app.state.mcp_asgi = mcp_server.streamable_http_app(
-        streamable_http_path="/",
-        json_response=True,
-        stateless_http=True,
-        transport_security=TransportSecuritySettings(
-            enable_dns_rebinding_protection=False
-        ),
-    )
-    # The session manager is an anyio task group, which must be entered and
-    # exited from the same task. Holding it open across `yield` here would not
-    # be: ASGI startup and shutdown can run in different tasks, which surfaces
-    # as "Attempted to exit cancel scope in a different task". Giving it a
-    # dedicated task that owns the whole `async with` keeps both ends together,
-    # and cancelling that task is what closes it.
-    started = asyncio.Event()
+    app.state.mcp_asgi = None
+    manager_task: asyncio.Task | None = None
 
-    async def _run_session_manager() -> None:
-        async with mcp_server.session_manager.run():
-            started.set()
-            await asyncio.Event().wait()  # until cancelled at shutdown
+    if settings.mcp_enabled:
+        # Built per-lifespan, not once at import. A StreamableHTTPSessionManager
+        # refuses a second .run(), so a module-level instance works in
+        # production (one lifespan) but breaks any process that starts the app
+        # twice -- which the test suite does for every test.
+        #
+        # A mounted sub-application's lifespan never runs, so .run() has to be
+        # entered here or the first /mcp request fails on a missing task group.
+        mcp_server = build_mcp_server(_mcp_generate, _mcp_status)
+        mcp_asgi = mcp_server.streamable_http_app(
+            streamable_http_path="/",
+            json_response=True,
+            stateless_http=True,
+            transport_security=TransportSecuritySettings(
+                enable_dns_rebinding_protection=False
+            ),
+        )
+        # The session manager is an anyio task group, which must be entered and
+        # exited from the same task. Holding it open across `yield` would not
+        # be: ASGI startup and shutdown can run in different tasks, which
+        # surfaces as "Attempted to exit cancel scope in a different task".
+        # A dedicated task owning the whole `async with` keeps both ends
+        # together, and cancelling it is what closes the group.
+        started = asyncio.Event()
 
-    manager_task = asyncio.create_task(_run_session_manager())
-    await started.wait()
+        async def _run_session_manager() -> None:
+            async with mcp_server.session_manager.run():
+                started.set()
+                await asyncio.Event().wait()  # until cancelled at shutdown
+
+        manager_task = asyncio.create_task(_run_session_manager())
+
+        # Bounded, and watching the task as well as the event. A bare
+        # `await started.wait()` blocks forever if the manager raises before
+        # setting it: uvicorn never finishes starting, the healthcheck never
+        # passes, and the container restart-loops with no error to show for it.
+        # Whatever goes wrong here, the API and UI must still come up.
+        waiter = asyncio.create_task(started.wait())
+        try:
+            await asyncio.wait(
+                {waiter, manager_task},
+                timeout=MCP_STARTUP_TIMEOUT,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            waiter.cancel()
+
+        if started.is_set():
+            app.state.mcp_asgi = mcp_asgi
+            logger.info("MCP endpoint ready at /mcp")
+        else:
+            exc = manager_task.done() and manager_task.exception()
+            logger.error(
+                "MCP session manager failed to start (%s); /mcp is disabled but "
+                "the API and UI are unaffected.",
+                exc or f"no response in {MCP_STARTUP_TIMEOUT}s",
+            )
+            manager_task.cancel()
+            manager_task = None
+    else:
+        logger.warning("MCP endpoint disabled by BITNET_MCP_ENABLED")
 
     try:
         yield
     finally:
-        manager_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await manager_task
+        if manager_task is not None:
+            manager_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await manager_task
         app.state.mcp_asgi = None
         await app.state.client.aclose()
 
