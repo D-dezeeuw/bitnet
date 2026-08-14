@@ -85,6 +85,18 @@ class Settings:
         self.repeat_penalty = float(os.environ.get("BITNET_REPEAT_PENALTY", "1.1"))
         self.repeat_last_n = int(os.environ.get("BITNET_REPEAT_LAST_N", "64"))
 
+        # DRY sampling. repeat_penalty acts on single tokens in a window, which
+        # does little against this model's actual failure: a phrase repeated
+        # with small substitutions ("let's make it simple/easy/clear for you").
+        # DRY penalises repeated n-grams and is the sampler built for that.
+        # llama-server defaults dry_multiplier to 0.0, i.e. off, so it has to be
+        # sent explicitly. 0.8 is llama.cpp's suggested starting strength;
+        # allowed_length 2 lets ordinary bigrams recur while catching longer
+        # cycles. Set the multiplier to 0.0 to disable.
+        self.dry_multiplier = float(os.environ.get("BITNET_DRY_MULTIPLIER", "0.8"))
+        self.dry_base = float(os.environ.get("BITNET_DRY_BASE", "1.75"))
+        self.dry_allowed_length = int(os.environ.get("BITNET_DRY_ALLOWED_LENGTH", "2"))
+
         # Pre-MDL-1 the prompt carried no turn separators, so generation had to
         # be stopped by string-matching "User:". That truncated any reply which
         # legitimately contained the string. The correct template makes
@@ -296,6 +308,9 @@ class ChatRequest(BaseModel):
     # it, which is what produced the looping this exists to stop.
     repeat_penalty: float | None = Field(default=None, ge=1.0, le=2.0)
     repeat_last_n: int | None = Field(default=None, ge=0, le=2048)
+    # 0.0 disables DRY; the upper bound is well past anything useful, but
+    # leaves room to experiment on a model that loops this readily.
+    dry_multiplier: float | None = Field(default=None, ge=0.0, le=5.0)
     # Resume the trailing assistant turn instead of opening a new one.
     continuation: bool = False
 
@@ -421,6 +436,23 @@ def backend_payload(req: ChatRequest) -> dict:
             if req.repeat_last_n is not None
             else settings.repeat_last_n
         ),
+        # DRY, sent for the same reason: the backend default of 0.0 disables it.
+        # repeat_penalty alone does not fix this model's failure mode, which is
+        # a repeated *phrase* rather than a repeated token -- observed output
+        # cycled "let's make it simple/easy/clear for you" indefinitely. A token
+        # penalty barely touches that, because each variant differs by a word
+        # and the shared tokens are spread across a long window. DRY penalises
+        # repeated n-grams, which is precisely the pattern.
+        "dry_multiplier": (
+            req.dry_multiplier
+            if req.dry_multiplier is not None
+            else settings.dry_multiplier
+        ),
+        "dry_base": settings.dry_base,
+        "dry_allowed_length": settings.dry_allowed_length,
+        # -1 means "consider the whole context" -- a loop that starts early must
+        # still be penalised once generation is well past it.
+        "dry_penalty_last_n": -1,
     }
     if req.top_p is not None:
         payload["top_p"] = req.top_p

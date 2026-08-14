@@ -86,6 +86,7 @@ def settings(monkeypatch):
     # value into every test that follows -- which is exactly what happened.
     monkeypatch.setattr(app_module.settings, "repeat_penalty", 1.1)
     monkeypatch.setattr(app_module.settings, "repeat_last_n", 64)
+    monkeypatch.setattr(app_module.settings, "dry_multiplier", 0.8)
     return app_module.settings
 
 
