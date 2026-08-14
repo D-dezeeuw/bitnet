@@ -2,6 +2,8 @@
 
 import json
 
+from app import prompt_budget_chars
+
 
 def body(**kw):
     payload = {"messages": [{"role": "user", "content": "hi"}]}
@@ -92,7 +94,10 @@ class TestForwardedParameters:
                 "continuation": True,
             },
         )
-        assert backend.last_prompt == "User: hi<|eot_id|>Assistant: partial"
+        # The default system prompt is prepended; what matters for continuation
+        # is that the tail resumes the partial turn rather than opening a new one.
+        assert backend.last_prompt.endswith("User: hi<|eot_id|>Assistant: partial")
+        assert not backend.last_prompt.endswith("Assistant: ")
 
 
 class TestStreaming:
@@ -174,24 +179,30 @@ async def test_summarize_returns_a_summary(client, backend):
 
 
 class TestRepetitionPenalty:
-    """llama-server defaults repeat_penalty to 1.0 (disabled), which made the
-    model restate the same sentence until it hit n_predict. These pin the
-    penalty as always-sent rather than optional."""
+    """repeat_penalty is sent explicitly and defaults to 1.0 (off).
+
+    It was briefly 1.1 to stop the model restating a sentence until it hit
+    n_predict, but a token-level penalty punishes the function words and subject
+    nouns a sentence needs, and output degraded into "strings aren't be taken".
+    DRY covers that repetition properly. These pin the field as always-sent, so
+    the value is this project's choice rather than the backend's."""
 
     async def test_penalty_is_always_sent(self, client, backend):
         await client.post(
             "/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]}
         )
         payload = backend.requests[-1]
-        assert payload["repeat_penalty"] == 1.1
+        assert payload["repeat_penalty"] == 1.0
         assert payload["repeat_last_n"] == 64
 
-    async def test_penalty_is_never_the_disabling_default(self, client, backend):
-        """1.0 is the value that caused the looping; the default must not be it."""
+    async def test_penalty_defaults_to_off(self, client, backend):
+        """Deliberately 1.0 now. It was briefly 1.1, which suppressed the
+        function words a sentence needs and produced "strings aren't be taken".
+        DRY covers the phrase repetition this was aimed at."""
         await client.post(
             "/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]}
         )
-        assert backend.requests[-1]["repeat_penalty"] > 1.0
+        assert backend.requests[-1]["repeat_penalty"] == 1.0
 
     async def test_request_can_override_the_penalty(self, client, backend):
         await client.post(
@@ -247,7 +258,7 @@ class TestRepetitionPenalty:
         await client.post("/mcp?key=k", headers=h, json={
             "jsonrpc": "2.0", "id": 2, "method": "tools/call",
             "params": {"name": "bitnet_chat", "arguments": {"prompt": "hi"}}})
-        assert backend.requests[-1]["repeat_penalty"] == 1.1
+        assert backend.requests[-1]["repeat_penalty"] == 1.0
 
 
 class TestDrySampling:
@@ -385,3 +396,117 @@ class TestFinishReasonAcrossBackendVersions:
             "params": {"name": "bitnet_chat",
                        "arguments": {"prompt": "hi", "max_tokens": 5}}})
         assert "truncated" in r.text
+
+
+class TestSamplingDefaults:
+    """Conservative sampling. 1.58-bit quantisation blurs the probability
+    distribution, so settings that read as merely lively on a large model are
+    destructive here: every coherent reply observed came from temperature 0,
+    every rambling one from 0.7."""
+
+    async def test_temperature_defaults_to_the_configured_value(self, client, backend):
+        await client.post(
+            "/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]}
+        )
+        assert backend.requests[-1]["temperature"] == 0.3
+
+    async def test_min_p_is_always_sent(self, client, backend):
+        await client.post(
+            "/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]}
+        )
+        assert backend.requests[-1]["min_p"] == 0.1
+
+    async def test_request_can_override_both(self, client, backend):
+        await client.post(
+            "/v1/chat/completions",
+            json={
+                "messages": [{"role": "user", "content": "hi"}],
+                "temperature": 1.4,
+                "min_p": 0.02,
+            },
+        )
+        assert backend.requests[-1]["temperature"] == 1.4
+        assert backend.requests[-1]["min_p"] == 0.02
+
+
+class TestDefaultSystemPrompt:
+    """Without framing the model drifts into free association rather than
+    answering. Small instruct models lean on a system turn to stay anchored."""
+
+    async def test_it_is_prepended_when_absent(self, client, backend):
+        await client.post(
+            "/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]}
+        )
+        assert backend.last_prompt.startswith("System: TEST SYSTEM PROMPT<|eot_id|>")
+
+    async def test_a_caller_system_message_wins(self, client, backend):
+        """It fills a gap; it must not override intent."""
+        await client.post(
+            "/v1/chat/completions",
+            json={
+                "messages": [
+                    {"role": "system", "content": "Be a pirate"},
+                    {"role": "user", "content": "hi"},
+                ]
+            },
+        )
+        assert backend.last_prompt.startswith("System: Be a pirate<|eot_id|>")
+        assert "TEST SYSTEM PROMPT" not in backend.last_prompt
+
+    async def test_empty_setting_injects_nothing(self, client, backend, settings, monkeypatch):
+        monkeypatch.setattr(settings, "system_prompt", "")
+        await client.post(
+            "/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]}
+        )
+        assert backend.last_prompt.startswith("User: hi<|eot_id|>")
+
+    async def test_it_yields_rather_than_breaking_a_request_at_the_cap(
+        self, client, settings
+    ):
+        """At max_tokens == ctx_size the budget is a few characters. Injecting
+        regardless turned a previously working request into a 400."""
+        r = await client.post(
+            "/v1/chat/completions",
+            json={
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": settings.max_tokens_cap,
+            },
+        )
+        assert r.status_code == 200
+
+    async def test_it_is_dropped_rather_than_overflowing_the_budget(
+        self, client, settings, backend, monkeypatch
+    ):
+        """Injected before validation, so its characters are bounded like any
+        other message rather than slipping past the check that bounds them.
+
+        Here the user message alone fits but the prompt would push it over, so
+        the request is served without the prompt instead of being rejected.
+        """
+        marker = "x" * 200
+        monkeypatch.setattr(settings, "system_prompt", marker)
+        budget = prompt_budget_chars(256)
+        r = await client.post(
+            "/v1/chat/completions",
+            json={
+                "messages": [{"role": "user", "content": "y" * (budget - 100)}],
+                "max_tokens": 256,
+            },
+        )
+        assert r.status_code == 200
+        assert marker not in backend.last_prompt
+
+    async def test_mcp_tool_gets_the_same_framing(
+        self, client, backend, settings, monkeypatch
+    ):
+        monkeypatch.setattr(settings, "api_key", "k")
+        h = {"Content-Type": "application/json",
+             "Accept": "application/json, text/event-stream"}
+        await client.post("/mcp?key=k", headers=h, json={
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                       "clientInfo": {"name": "t", "version": "1"}}})
+        await client.post("/mcp?key=k", headers=h, json={
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "bitnet_chat", "arguments": {"prompt": "hi"}}})
+        assert backend.last_prompt.startswith("System: TEST SYSTEM PROMPT<|eot_id|>")

@@ -97,9 +97,12 @@ def settings(monkeypatch):
     # Reset the sampler defaults too. settings is a module-level singleton, so a
     # test that assigns to it directly rather than through monkeypatch leaks the
     # value into every test that follows -- which is exactly what happened.
-    monkeypatch.setattr(app_module.settings, "repeat_penalty", 1.1)
+    monkeypatch.setattr(app_module.settings, "repeat_penalty", 1.0)
     monkeypatch.setattr(app_module.settings, "repeat_last_n", 64)
     monkeypatch.setattr(app_module.settings, "dry_multiplier", 0.8)
+    monkeypatch.setattr(app_module.settings, "temperature", 0.3)
+    monkeypatch.setattr(app_module.settings, "min_p", 0.1)
+    monkeypatch.setattr(app_module.settings, "system_prompt", "TEST SYSTEM PROMPT")
     return app_module.settings
 
 

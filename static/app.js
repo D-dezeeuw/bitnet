@@ -199,7 +199,7 @@ async function streamResponse(el, existingText, isContinuation) {
     const body = {
       messages: buildMessages(),
       stream: true,
-      temperature: isNaN(tempVal) ? 0.7 : tempVal,
+      temperature: isNaN(tempVal) ? 0.3 : tempVal,
       top_p: isNaN(topPVal) ? 0.9 : topPVal,
       max_tokens: maxTokens
     };
