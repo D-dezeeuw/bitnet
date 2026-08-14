@@ -246,6 +246,7 @@ open to anything that can reach the container on the proxy network.
 | `MODEL_PATH` | `/app/models/model.gguf` | Path to GGUF model |
 | `MODEL_ID` | `bitnet-b1.58-2B-4T` | Model ID returned by the API |
 | `BITNET_API_PORT` | `8010` | Port the API listens on |
+| `BITNET_MCP_ENABLED` | `1` | Set to `0` to disable `/mcp` entirely |
 | `LLAMA_SERVER_PORT` | `8080` | Internal llama-server port, bound to `127.0.0.1` |
 | `BITNET_THREADS` | `4` | Inference threads (see note below) |
 | `BITNET_CTX_SIZE` | `4096` | Context window size, served to the UI via `/v1/status` |
@@ -381,6 +382,13 @@ A key in a URL is genuinely weaker than one in a header: it appears in reverse
 proxy access logs, in shell history, and in any error report that echoes the
 request line, and nothing that redacts `Authorization` will redact it. Treat
 the URL as the secret it contains, and rotate the key if it leaks.
+
+`BITNET_MCP_ENABLED=0` switches the endpoint off completely. The MCP server
+shares a process with the API, so a fault there would otherwise take the whole
+container down: `entrypoint.sh` exits when uvicorn does, and the restart policy
+then loops, killing `/v1` and the UI along with it. Startup also refuses to
+block on the MCP session manager — if it fails or does not come up within 30
+seconds, that is logged, `/mcp` serves `503`, and the API starts regardless.
 
 `/mcp` returns `503` unless `BITNET_API_KEY` is set. It fails closed rather
 than open because an unauthenticated MCP endpoint on a public host lets anyone
