@@ -316,3 +316,72 @@ class TestDrySampling:
             "jsonrpc": "2.0", "id": 2, "method": "tools/call",
             "params": {"name": "bitnet_chat", "arguments": {"prompt": "hi"}}})
         assert backend.requests[-1]["dry_multiplier"] == 0.8
+
+
+class TestFinishReasonAcrossBackendVersions:
+    """A reply cut off at max_tokens must report finish_reason "length".
+
+    Production returned exactly max_tokens, cut mid-sentence, labelled "stop":
+    the code read only llama.cpp's older `stopped_limit`, while the deployed
+    backend reports the newer `stop_type`. The stub emitted only the old field,
+    so the suite agreed with the code and neither matched reality.
+
+    The UI's Continue button and the MCP truncation notice both key off this.
+    """
+
+    async def test_new_stop_type_field_is_understood(self, client, backend):
+        backend.stop_field = "stop_type"
+        backend.stopped_limit = True
+        r = await client.post(
+            "/v1/chat/completions",
+            json={"messages": [{"role": "user", "content": "hi"}], "max_tokens": 5},
+        )
+        assert r.json()["choices"][0]["finish_reason"] == "length"
+
+    async def test_old_stopped_limit_field_still_understood(self, client, backend):
+        backend.stop_field = "stopped_limit"
+        backend.stopped_limit = True
+        r = await client.post(
+            "/v1/chat/completions",
+            json={"messages": [{"role": "user", "content": "hi"}], "max_tokens": 5},
+        )
+        assert r.json()["choices"][0]["finish_reason"] == "length"
+
+    async def test_natural_stop_is_not_reported_as_length(self, client, backend):
+        backend.stop_field = "stop_type"
+        backend.stopped_limit = False
+        r = await client.post(
+            "/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]}
+        )
+        assert r.json()["choices"][0]["finish_reason"] == "stop"
+
+    async def test_streaming_reports_length_with_the_new_field(self, client, backend):
+        backend.stop_field = "stop_type"
+        backend.stopped_limit = True
+        r = await client.post(
+            "/v1/chat/completions",
+            json={
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+                "max_tokens": 5,
+            },
+        )
+        assert '"finish_reason": "length"' in r.text or '"finish_reason":"length"' in r.text
+
+    async def test_mcp_flags_truncation_with_the_new_field(
+        self, client, backend, settings, monkeypatch
+    ):
+        backend.stop_field = "stop_type"
+        backend.stopped_limit = True
+        monkeypatch.setattr(settings, "api_key", "k")
+        h = {"Content-Type": "application/json",
+             "Accept": "application/json, text/event-stream"}
+        await client.post("/mcp?key=k", headers=h, json={
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                       "clientInfo": {"name": "t", "version": "1"}}})
+        r = await client.post("/mcp?key=k", headers=h, json={
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "bitnet_chat",
+                       "arguments": {"prompt": "hi", "max_tokens": 5}}})
+        assert "truncated" in r.text
