@@ -251,6 +251,9 @@ open to anything that can reach the container on the proxy network.
 | `BITNET_CTX_SIZE` | `4096` | Context window size, served to the UI via `/v1/status` |
 | `BITNET_REPEAT_PENALTY` | `1.1` | Repetition penalty (see note below) |
 | `BITNET_REPEAT_LAST_N` | `64` | Token window the penalty applies over |
+| `BITNET_DRY_MULTIPLIER` | `0.8` | DRY n-gram repetition penalty; `0` disables |
+| `BITNET_DRY_BASE` | `1.75` | DRY growth base |
+| `BITNET_DRY_ALLOWED_LENGTH` | `2` | N-gram length DRY tolerates before penalising |
 | `BITNET_QUEUE_TIMEOUT` | `3` | Seconds to wait for the inference slot before `503` |
 | `BITNET_READ_TIMEOUT` | `900` | Backend read timeout for non-streaming requests |
 | `BITNET_CONNECT_TIMEOUT` | `5` | Backend connect timeout |
@@ -282,6 +285,22 @@ hit `n_predict` instead of ending its turn. `1.1` is llama.cpp's long-standing
 default and the smallest value that reliably breaks the cycle. Going much above
 `1.2` starts costing fluency, because legitimate repetition (names, list items,
 code) gets punished too. A request may override it, including back to `1.0`.
+
+Two anti-repetition samplers are sent on every request, because llama-server
+disables both by default and this model loops badly without them. They address
+different failures and are not interchangeable:
+
+- **`repeat_penalty`** acts on individual tokens in a sliding window. It stops
+  a single token being emitted over and over.
+- **`dry_multiplier`** (DRY) penalises repeated *n-grams*. This is the one that
+  matters here: the observed failure was a phrase cycling with substitutions
+  ("let's make it simple / easy / clear for you"), which a token-level penalty
+  barely touches because each variant differs by a word.
+
+`dry_penalty_last_n` is fixed at `-1` so DRY considers the whole context: a loop
+that starts early must still be penalised late in a long generation. Set
+`BITNET_DRY_MULTIPLIER=0` to turn DRY off, or override either sampler per
+request.
 
 `BITNET_THREADS` defaults to 4, which is a conservative guess rather than a
 measured value; upstream benchmarks x86 at 8 threads. Measure on the deployment

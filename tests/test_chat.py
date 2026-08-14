@@ -248,3 +248,71 @@ class TestRepetitionPenalty:
             "jsonrpc": "2.0", "id": 2, "method": "tools/call",
             "params": {"name": "bitnet_chat", "arguments": {"prompt": "hi"}}})
         assert backend.requests[-1]["repeat_penalty"] == 1.1
+
+
+class TestDrySampling:
+    """repeat_penalty acts on single tokens, so it barely dents the observed
+    failure: a phrase repeated with substitutions ("let's make it simple/easy/
+    clear for you"). DRY penalises repeated n-grams, which is that pattern."""
+
+    async def test_dry_is_always_sent(self, client, backend):
+        await client.post(
+            "/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]}
+        )
+        payload = backend.requests[-1]
+        assert payload["dry_multiplier"] == 0.8
+        assert payload["dry_base"] == 1.75
+        assert payload["dry_allowed_length"] == 2
+
+    async def test_dry_is_never_left_disabled_by_default(self, client, backend):
+        """0.0 is llama-server's default and means off -- the state that let the
+        model loop. The default here must not be it."""
+        await client.post(
+            "/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]}
+        )
+        assert backend.requests[-1]["dry_multiplier"] > 0.0
+
+    async def test_dry_penalty_spans_the_whole_context(self, client, backend):
+        """-1, so a loop that began early is still penalised later in a long
+        generation; a bounded window stops seeing the phrase it should catch."""
+        await client.post(
+            "/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]}
+        )
+        assert backend.requests[-1]["dry_penalty_last_n"] == -1
+
+    async def test_request_can_override_dry(self, client, backend):
+        await client.post(
+            "/v1/chat/completions",
+            json={
+                "messages": [{"role": "user", "content": "hi"}],
+                "dry_multiplier": 1.5,
+            },
+        )
+        assert backend.requests[-1]["dry_multiplier"] == 1.5
+
+    async def test_caller_can_disable_dry(self, client, backend):
+        await client.post(
+            "/v1/chat/completions",
+            json={"messages": [{"role": "user", "content": "hi"}], "dry_multiplier": 0.0},
+        )
+        assert backend.requests[-1]["dry_multiplier"] == 0.0
+
+    async def test_negative_multiplier_is_rejected(self, client):
+        r = await client.post(
+            "/v1/chat/completions",
+            json={"messages": [{"role": "user", "content": "hi"}], "dry_multiplier": -1},
+        )
+        assert r.status_code == 422
+
+    async def test_mcp_tool_gets_dry_too(self, client, backend, settings, monkeypatch):
+        monkeypatch.setattr(settings, "api_key", "k")
+        h = {"Content-Type": "application/json",
+             "Accept": "application/json, text/event-stream"}
+        await client.post("/mcp?key=k", headers=h, json={
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                       "clientInfo": {"name": "t", "version": "1"}}})
+        await client.post("/mcp?key=k", headers=h, json={
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "bitnet_chat", "arguments": {"prompt": "hi"}}})
+        assert backend.requests[-1]["dry_multiplier"] == 0.8
