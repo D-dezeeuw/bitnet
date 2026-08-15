@@ -548,11 +548,18 @@ def _build_prompt_bitnet(
 ) -> str:
     """Render the GGUF-embedded template. See build_prompt for the repairs.
 
-    The template has no system branch, so EVERY system message -- wherever it
-    sits, including the compaction summaries the UI injects mid-conversation
-    -- is folded into the next user turn rather than dropped; dropping one
-    silently would discard exactly the summarized history compaction was
-    preserving. A message list that ends without a user turn still gets the
+    The template has no system branch at all, so EVERY system message --
+    wherever it sits, including the compaction summaries the UI injects
+    mid-conversation -- is folded into the next user turn rather than dropped;
+    dropping one silently would discard exactly the summarized history
+    compaction was preserving.
+
+    Folding is a genuine compromise, not a neutral choice: the model cannot
+    tell the operator's instructions from the user's words, so a system prompt
+    reads as something the USER said. That is a real argument for preferring
+    the "hf" format, which has a true System: turn. It is marked here rather
+    than hidden, and the fold is labelled so the boundary is at least visible
+    to the model. A message list that ends without a user turn still gets the
     generation prompt appended, so generation always starts inside an
     assistant turn rather than dangling after an end-of-text token.
     """
@@ -571,17 +578,18 @@ def _build_prompt_bitnet(
         elif m.role == "user":
             content = m.content.strip()
             if pending_system:
-                content = "\n\n".join([*pending_system, content])
+                # Labelled, not silently concatenated: without a marker the
+                # model reads the operator's framing as the user's own words.
+                framing = "\n\n".join(pending_system)
+                content = f"[Instructions: {framing}]\n\n{content}"
                 pending_system = []
             parts.append(f"Human: {content}\n\n{BITNET_GENERATION_PROMPT}")
         elif m.role == "assistant":
             parts.append(f" {m.content.strip()}{END_OF_TEXT}")
     if pending_system:
         # System content with no user turn after it still reaches the model.
-        parts.append(
-            "Human: " + "\n\n".join(pending_system)
-            + f"\n\n{BITNET_GENERATION_PROMPT}"
-        )
+        framing = "\n\n".join(pending_system)
+        parts.append(f"Human: [Instructions: {framing}]\n\n{BITNET_GENERATION_PROMPT}")
 
     prompt = "".join(parts)
     if partial is not None:
@@ -820,6 +828,19 @@ class LoopGuard:
     PREFIX_LEN = 25
     PREFIX_RUN = 3
 
+    #: Third signal, and the one that catches this model's worst output. A
+    #: single similarity threshold provably cannot separate degenerate from
+    #: legitimate here, because the degenerate text scores LOWER: an observed
+    #: wall of "The string theory is a {term,way,method,technique,strategy}
+    #: that describes the strings of string." scores 0.86-0.95 between
+    #: sentences, while a legitimate pair differing only by
+    #: "active"/"inactive" scores 0.98. What separates them is not how similar
+    #: any pair is but HOW MANY near-duplicates there are: real prose has at
+    #: most one, that wall has seventeen. So near-duplicates are counted at a
+    #: threshold low enough to see them, and one is forgiven.
+    WEAK_SIMILARITY = 0.85
+    WEAK_ALLOWANCE = 1
+
     MIN_PHRASE = 12
     # 400 rather than 200: the headline failure is the model restating its
     # ENTIRE answer verbatim, and a two-sentence answer is easily 200+ chars.
@@ -843,6 +864,8 @@ class LoopGuard:
         # Set by the near-duplicate check: cut the text here rather than
         # collapsing a repeated block.
         self._cut_at: int | None = None
+        self._weak_hits = 0
+        self._first_weak_start: int | None = None
 
     def feed(self, token_text: str) -> bool:
         """Append newly generated text; True when either threshold is hit."""
@@ -922,19 +945,48 @@ class LoopGuard:
         latest_n = self._normalise(latest)
         if len(latest_n) < self.MIN_SENTENCE:
             return False
+
+        best = 0.0
+        best_earlier = ""
         for _, earlier in sentences[:-1]:
             earlier_n = self._normalise(earlier)
             if len(earlier_n) < self.MIN_SENTENCE:
                 continue
             ratio = difflib.SequenceMatcher(None, earlier_n, latest_n).ratio()
-            if ratio >= self.echo_similarity:
+            if ratio > best:
+                best, best_earlier = ratio, earlier
+
+        # Near-exact restatement: act on the first one. Nothing legitimate
+        # measured reaches here.
+        if best >= self.echo_similarity:
+            self.tripped = True
+            self._cut_at = start
+            logger.warning(
+                "Echo guard tripped (%.2f similar): %r restates %r",
+                best,
+                latest[:60],
+                best_earlier[:60],
+            )
+            return True
+
+        # Looser near-duplicate: count it, forgive the first. Counted once per
+        # sentence, not once per pair, so a long wall does not trip on its own
+        # internal comparisons before the sentence count grows.
+        if best >= self.WEAK_SIMILARITY:
+            self._weak_hits += 1
+            if self._first_weak_start is None:
+                self._first_weak_start = start
+            if self._weak_hits > self.WEAK_ALLOWANCE:
                 self.tripped = True
-                self._cut_at = start
+                # Cut at the FIRST near-duplicate: everything from there on is
+                # restatement, and the sentence before it is the real answer.
+                self._cut_at = self._first_weak_start
                 logger.warning(
-                    "Echo guard tripped (%.2f similar): %r restates %r",
-                    ratio,
-                    latest[:60],
-                    earlier[:60],
+                    "Echo guard tripped: %d near-duplicate sentences "
+                    "(latest %.2f similar to %r)",
+                    self._weak_hits,
+                    best,
+                    best_earlier[:60],
                 )
                 return True
         return False
@@ -1372,6 +1424,14 @@ async def config(request: Request):
                 BITNET_GENERATION_PROMPT
                 if settings.prompt_format == "bitnet"
                 else GENERATION_PROMPT
+            ),
+            "system_handling": (
+                "separate System: turn"
+                if settings.prompt_format == "hf"
+                else "folded into the first user turn as [Instructions: ...] "
+                "-- the GGUF template has no system role, so the model cannot "
+                "fully distinguish it from the user's words. Prefer 'hf' if "
+                "the system prompt matters."
             ),
             "example": build_prompt(
                 [

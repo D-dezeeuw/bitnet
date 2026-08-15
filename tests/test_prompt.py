@@ -122,7 +122,7 @@ class TestBitnetFormat:
         """The embedded template has no system branch at all; dropping the
         system message silently would discard caller intent."""
         prompt = build_prompt(msgs(("system", "Be terse"), ("user", "hi")))
-        assert prompt == "Human: Be terse\n\nhi\n\nBITNETAssistant:"
+        assert prompt == "Human: [Instructions: Be terse]\n\nhi\n\nBITNETAssistant:"
 
     def test_no_trailing_space_here_either(self):
         assert not build_prompt(msgs(("user", "hi"))).endswith(" ")

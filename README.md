@@ -230,9 +230,28 @@ Two chat templates exist for this model because Microsoft shipped two: the HF
 and the one their conversion script embedded in the GGUF itself
 (`Human:`/`BITNETAssistant:` with blank lines and `<|end_of_text|>`), which is
 what their demo effectively runs. `BITNET_PROMPT_FORMAT=bitnet` switches to
-the latter — an A/B worth running if reply quality stays poor, since which
-template this quantised checkpoint answers better under is an empirical
-question.
+the latter.
+
+**The `hf` format is the better default, and the system prompt is why.** The
+GGUF-embedded template has no `system` role at all — Microsoft's conversion
+script simply omits one. Under `bitnet`, a system prompt therefore cannot be
+its own turn; it is folded into the first user turn, labelled
+`[Instructions: ...]` so the boundary is at least visible to the model:
+
+```text
+Human: [Instructions: You are a helpful assistant.]
+
+What is gravity?
+
+BITNETAssistant:
+```
+
+The label is a mitigation, not a fix. The model still cannot fully separate
+the operator's framing from the user's words, and a prompt-injection-shaped
+input reads identically to instructions. Under `hf` the same messages render
+as a distinct `System: ...<|eot_id|>` turn. If the system prompt matters —
+and for guardrails it does — use `hf`. The config panel states which handling
+is active.
 
 ## Architecture
 

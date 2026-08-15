@@ -860,3 +860,86 @@ class TestEchoGuard:
         )
         assert text.count("Gravity is a force") <= 2
         assert frames[-1] == "[DONE]"
+
+
+class TestEchoGuardCountRule:
+    """A single similarity threshold provably cannot separate degenerate from
+    legitimate output here, because the degenerate text scores LOWER.
+
+    Measured: an observed wall of "The string theory is a {term,way,method}
+    that describes the strings of string." scores 0.86-0.95 between sentences,
+    while a legitimate pair differing only by "active"/"inactive" scores 0.98.
+    What separates them is the COUNT of near-duplicates -- one versus
+    seventeen -- so they are counted at a low threshold and one is forgiven.
+    """
+
+    SCREENSHOT_WALL = (
+        "The string theory is a mathematical concept that describes the "
+        "strings of strings. It is a theory that describes the strings of "
+        "string theory.\n"
+        "The string theory is a concept that describes the string of string "
+        "theory.\n"
+        "The string theory is a term that describes the strings of string.\n"
+        "The string theory is a way that describes the strings of string.\n"
+        "The string theory is a method that describes the strings of string.\n"
+        "The string theory is a technique that describes the strings of string."
+    )
+
+    async def test_varied_word_wall_is_cut(self, client, backend):
+        """Captured from the deployment: 256 tokens of the same sentence with
+        one noun swapped each time. Scores too low for the strong threshold and
+        shares too short a prefix for the prefix rule; only the count catches
+        it."""
+        backend.content = self.SCREENSHOT_WALL
+        r = await client.post("/v1/chat/completions", json=body())
+        content = r.json()["choices"][0]["message"]["content"]
+        assert content.count("The string theory is a") <= 2
+        assert len(content) < len(self.SCREENSHOT_WALL) / 2
+
+    async def test_one_near_duplicate_is_forgiven(self, client, backend):
+        """0.98 similar and the difference IS the meaning. Real prose has at
+        most one of these; degenerate output has many."""
+        text = (
+            "This function returns the total number of active users. "
+            "This function returns the total number of inactive users."
+        )
+        backend.content = text
+        r = await client.post("/v1/chat/completions", json=body())
+        assert r.json()["choices"][0]["message"]["content"] == text
+
+    async def test_technical_prose_with_a_shared_subject_survives(self, client, backend):
+        text = (
+            "The container joins the proxy network on a static address. "
+            "Nginx forwards requests to that address on port 8010. "
+            "TLS terminates at the proxy, so the backend speaks plain HTTP."
+        )
+        backend.content = text
+        r = await client.post("/v1/chat/completions", json=body())
+        assert r.json()["choices"][0]["message"]["content"] == text
+
+    async def test_cut_keeps_the_sentence_that_answered(self, client, backend):
+        """Cutting at the FIRST near-duplicate keeps the original statement and
+        drops every restatement after it."""
+        backend.content = (
+            "The string theory is a term that describes the strings of string. "
+            "The string theory is a way that describes the strings of string. "
+            "The string theory is a method that describes the strings of string."
+        )
+        r = await client.post("/v1/chat/completions", json=body())
+        content = r.json()["choices"][0]["message"]["content"]
+        assert content == (
+            "The string theory is a term that describes the strings of string."
+        )
+
+    async def test_a_genuinely_diverging_third_sentence_is_kept(self, client, backend):
+        """Only ONE of these is a near-duplicate; the third restates loosely
+        enough (0.81) to be ordinary variation. One is forgiven, so the reply
+        stands."""
+        text = (
+            "Gravity pulls objects with mass toward one another constantly. "
+            "Gravity pulls objects with mass toward each other constantly. "
+            "Gravity pulls objects that have mass toward each other always."
+        )
+        backend.content = text
+        r = await client.post("/v1/chat/completions", json=body())
+        assert r.json()["choices"][0]["message"]["content"] == text
