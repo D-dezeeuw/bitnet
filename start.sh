@@ -113,17 +113,21 @@ else
   echo "API key authentication: DISABLED (set BITNET_API_KEY to require one)"
 fi
 
-# Forward configuration into the container. Only variables the container reads
-# are passed: IMAGE/CONTAINER/NETWORK/STATIC_IP/HOST_PORT govern `docker run`
-# itself and mean nothing inside. Unset variables are skipped so the image's own
-# ENV defaults apply rather than being overridden with an empty string.
-for var in \
-  BITNET_API_KEY BITNET_THREADS BITNET_CTX_SIZE BITNET_QUEUE_TIMEOUT \
-  BITNET_READ_TIMEOUT BITNET_CONNECT_TIMEOUT BITNET_MAX_MESSAGES \
-  BITNET_SESSION_TTL BITNET_ROLE_STOP_FALLBACK BITNET_TRUSTED_PROXIES \
-  BITNET_STARTUP_TIMEOUT BITNET_API_PORT BITNET_STATIC_DIR \
-  BITNET_DOWNLOAD_PATH MODEL_ID LLAMA_SERVER_PORT
-do
+# Forward configuration into the container by CONVENTION, not by a list: every
+# BITNET_* variable is a container setting, and the deploy-only knobs
+# (IMAGE, CONTAINER, NETWORK, STATIC_IP, HOST_PORT) deliberately carry no such
+# prefix because they govern `docker run` itself and mean nothing inside.
+#
+# This was a hand-maintained list, and it drifted exactly as you would expect:
+# BITNET_TEMPERATURE, BITNET_SYSTEM_PROMPT, BITNET_LOOP_GUARD, the DRY knobs and
+# BITNET_PROMPT_FORMAT were all added to app.py, documented as configurable, and
+# never added here -- so setting any of them in .env did nothing at all. Reading
+# the environment instead means a new setting works the moment it exists.
+#
+# compgen -v yields variable NAMES only, so values containing newlines (a
+# multi-line BITNET_SYSTEM_PROMPT) survive intact. Unset variables are skipped
+# so the image's own ENV defaults apply rather than being overridden with "".
+for var in $(compgen -v | grep '^BITNET_' | sort) MODEL_ID LLAMA_SERVER_PORT; do
   if [ -n "${!var:-}" ]; then
     RUN_ARGS+=(-e "$var=${!var}")
   fi
