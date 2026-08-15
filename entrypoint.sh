@@ -20,11 +20,21 @@ echo "Starting llama-server on internal port $PORT (threads=$THREADS ctx=$CTX)..
 # --parallel 1 is explicit: -c is the TOTAL KV cache split across slots, so if
 # the default slot count were ever above 1 each slot would silently get a
 # fraction of CTX and the API would advertise a context it does not have.
+#
+# --special is load-bearing, not cosmetic. The model ends its turn by emitting
+# <|eot_id|>, but the GGUF declares eos as <|end_of_text|>, so that token does
+# not auto-stop generation; the API stops on the STRING "<|eot_id|>" instead.
+# Without --special the server renders special tokens as empty text, so the
+# string never appears, the stop never fires, and generation runs to n_predict
+# -- the model restarts its turn and loops, restating the answer until the
+# token budget is gone. The tell was sentences fused without a space
+# ("universe.String theory is"): the invisible dropped token between them.
 llama-server \
     -m "$MODEL" \
     --port "$PORT" \
     --host 127.0.0.1 \
     --parallel 1 \
+    --special \
     -t "$THREADS" \
     -c "$CTX" &
 LLAMA_PID=$!

@@ -148,6 +148,16 @@ trained turn terminator is `<|eot_id|>`. llama-server's automatic EOS stop
 therefore never fires at end of turn, which is why `<|eot_id|>` is passed as an
 explicit stop sequence.
 
+That stop sequence is a *string*, and it only matches because `entrypoint.sh`
+starts llama-server with `--special`, which renders special tokens into the
+output text. Without that flag the server renders `<|eot_id|>` as empty text:
+the model ends its turn, nothing stops, and it is forced to keep generating —
+so it restarts and restates its answer until `n_predict` runs out. That was the
+cause of every "model loops forever" report against this deployment; the
+visible tell was sentences fused without a space (`universe.String theory is`),
+which is where the invisible token was dropped. No sampler setting can fix a
+stop that never fires.
+
 ## Architecture
 
 ```text

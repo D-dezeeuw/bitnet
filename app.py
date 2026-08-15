@@ -149,6 +149,12 @@ CHARS_PER_TOKEN = 3.5
 # Turn terminator the model was trained to emit. Note the GGUF declares
 # eos_token as <|end_of_text|>, NOT this, so llama-server's automatic EOS stop
 # never fires at end of turn -- listing it explicitly is required, not a hack.
+#
+# This string stop only works because entrypoint.sh starts llama-server with
+# --special, which renders special tokens into the output text. Without that
+# flag <|eot_id|> renders as empty text, the string never matches, and the
+# model -- which did end its turn -- is forced onward and loops, restating its
+# answer until n_predict. Remove --special and every reply degrades that way.
 EOT = "<|eot_id|>"
 GENERATION_PROMPT = "Assistant: "
 DEFAULT_STOPS = [EOT, "<|end_of_text|>"]
