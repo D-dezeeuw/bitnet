@@ -86,3 +86,29 @@ async def test_root_redirects_to_the_ui(client):
     r = await client.get("/", follow_redirects=False)
     assert r.status_code in (307, 308)
     assert r.headers["location"] == "/inference"
+
+
+async def test_status_serves_the_default_system_prompt(client, settings):
+    """The UI needs it to keep the framing prompt alive through compaction:
+    the compaction summary is a system message, which would otherwise
+    suppress the default exactly when conversations get long."""
+    data = (await client.get("/v1/status")).json()
+    assert data["default_system_prompt"] == settings.system_prompt
+
+
+async def test_system_prompt_is_not_served_unauthenticated(client, settings, monkeypatch):
+    """/v1/status stays reachable pre-auth, but the operator's custom system
+    prompt is configuration: with a key set, anonymous visitors get the
+    runtime facts without it."""
+    monkeypatch.setattr(settings, "api_key", "sekrit")
+    data = (await client.get("/v1/status")).json()
+    assert "default_system_prompt" not in data
+    assert data["auth_required"] is True
+
+
+async def test_system_prompt_is_served_to_key_holders(client, settings, monkeypatch):
+    monkeypatch.setattr(settings, "api_key", "sekrit")
+    data = (
+        await client.get("/v1/status", headers={"Authorization": "Bearer sekrit"})
+    ).json()
+    assert data["default_system_prompt"] == settings.system_prompt
