@@ -122,6 +122,25 @@ restatement, and no combination of template, sampler, or system prompt tested
 here changes that — both shipped chat templates and the full sampler range were
 tried. This is a 2B model at 1.58 bits per weight; the ceiling is the model.
 
+### Why the system prompt is short
+
+Instructions make this model worse, which is worth knowing before adding more:
+
+| System prompt | Result for "What is gravity?" |
+|---|---|
+| One line ("Answer the question directly.") | Answers, then restates once |
+| Five clauses (concise / never repeat / stop when done / say if unsure) | Begins echoing the question back: `What is gravity? Gravity is a force...` |
+| "Answer, then write END and stop" | Emitted `END` and stopped correctly — but the *answer* was the question echoed back |
+| "Reply with exactly one sentence" | Ignored entirely |
+
+Instructions are followed *mechanically* while derailing the answer. Asking the
+model to police its own repetition does not work; the guards above do that
+instead, which is why the default prompt is one sentence.
+
+Telling it which stop token to emit is also not possible: `<|eot_id|>` is a
+control token (id 128009), and writing it into a system prompt tokenises it as
+a real turn boundary *inside* the message, corrupting the prompt structure.
+
 For a deployment that must answer open questions well, the honest fix is a
 different GGUF (Qwen2.5-3B-Instruct or Llama-3.2-3B-Instruct at Q4 run on the
 same llama.cpp with far better instruction following). The proxy, guardrails,
@@ -200,8 +219,9 @@ guardrail:
 |---|---|
 | Never emits an end-of-turn token on open-ended prompts, restating its answer to the token cap | **Loop guard**: the proxy watches generated text; a phrase repeated `BITNET_LOOP_GUARD_REPEATS` (4) times consecutively aborts the backend generation (freeing the slot), trims the repeats, and finishes cleanly. `BITNET_LOOP_GUARD=0` disables. |
 | Ends its turn by writing the NEXT speaker's label instead of an end token — an observed reply ran `...things fall down.Human: Explain string theory...` and then answered itself | **Role-label stops**, on by default and matched to the active template (`User:`/`System:` for `hf`, `Human:` for `bitnet`). Often the only stop that can fire. `BITNET_ROLE_STOPS=0` disables. |
+| Answers correctly in one sentence, then restates it with a word changed — `...towards the center of the Earth.` then `...toward the center of the Earth.` — so nothing matches exactly and no sampler fires | **Echo guard**: a completed sentence ≥`BITNET_ECHO_SIMILARITY` (0.99) similar to an earlier one cuts the reply there, as does a third consecutive sentence opening with the same 25 characters. Threshold measured, not chosen: real restatements score 0.99-1.00 and the closest legitimate pair found scores 0.98. `BITNET_ECHO_GUARD=0` disables. |
 | Word-substituted restatements ("simple/easy/clear") | DRY sampling (`BITNET_DRY_MULTIPLIER=0.8`), the n-gram penalty built for it |
-| Rambles without framing | Default system prompt, applied when the caller sends none; kept alive through UI context compaction |
+| Rambles without framing | Default system prompt, applied when the caller sends none; kept alive through UI context compaction. Deliberately **short** — see below |
 | Degenerate start from an out-of-distribution boundary token | The generation prompt ends at `Assistant:` with no trailing space; the model supplies the reply's leading space and the API strips it |
 | Fragile under lively sampling | `temperature` 0.3, `min_p` 0.1 defaults; the UI no longer force-sends `top_p` |
 
@@ -326,6 +346,8 @@ open to anything that can reach the container on the proxy network.
 | `BITNET_LOOP_GUARD_REPEATS` | `4` | Consecutive phrase repeats that trigger the cutoff (min 2; single-character runs use a higher bar so banners and rules survive) |
 | `BITNET_PROMPT_FORMAT` | `hf` | Chat template: `hf` (tokenizer_config) or `bitnet` (GGUF-embedded) |
 | `BITNET_ROLE_STOPS` | `1` | Stop when the model writes the next speaker's label |
+| `BITNET_ECHO_GUARD` | `1` | Cut the reply when a sentence restates an earlier one |
+| `BITNET_ECHO_SIMILARITY` | `0.99` | Similarity ratio that counts as a restatement |
 | `BITNET_DRY_BASE` | `1.75` | DRY growth base |
 | `BITNET_DRY_ALLOWED_LENGTH` | `2` | N-gram length DRY tolerates before penalising |
 | `BITNET_QUEUE_TIMEOUT` | `3` | Seconds to wait for the inference slot before `503` |

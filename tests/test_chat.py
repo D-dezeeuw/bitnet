@@ -593,7 +593,10 @@ class TestLoopGuard:
         assert r.json()["choices"][0]["message"]["content"] == backend.content
 
     async def test_guard_can_be_disabled(self, client, backend, settings, monkeypatch):
+        # Both guards: the echo guard would otherwise cut this text at the
+        # first restatement, which is its job but not what this test measures.
         monkeypatch.setattr(settings, "loop_guard_repeats", 0)
+        monkeypatch.setattr(settings, "echo_similarity", 0.0)
         backend.content = self.LOOP
         r = await client.post("/v1/chat/completions", json=body())
         assert r.json()["choices"][0]["message"]["content"] == self.LOOP
@@ -756,3 +759,104 @@ class TestContinuationSpaceEdgeCase:
             },
         )
         assert r.json()["choices"][0]["message"]["content"] == "Sure, here it is."
+
+
+class TestEchoGuard:
+    """This model's dominant failure is not an exact loop: it answers correctly
+    in one sentence, then restates that sentence with a word changed. Nothing
+    matches exactly, so DRY and the exact loop guard both miss it -- but the
+    reply was already complete after sentence one.
+
+    Every REAL_* case below is output captured from the deployment.
+    """
+
+    REAL_GRAVITY = (
+        "Gravity is a force that pulls objects towards the center of the Earth."
+        "Gravity is a force that pulls objects toward the center of the Earth.\n"
+        "Gravity is a force that pulls object toward the center of the earth."
+    )
+
+    async def test_restatement_is_cut_leaving_the_answer(self, client, backend):
+        backend.content = self.REAL_GRAVITY
+        r = await client.post("/v1/chat/completions", json=body())
+        content = r.json()["choices"][0]["message"]["content"]
+        assert content == (
+            "Gravity is a force that pulls objects towards the center of the Earth."
+        )
+
+    async def test_fused_seam_is_a_sentence_boundary(self, client, backend):
+        """The restatement fuses onto the previous sentence with no space
+        ("Earth.Gravity"). Requiring whitespace made the guard blind to exactly
+        the boundary it exists to find."""
+        backend.content = "The capital of France is Paris.The capital of France is paris."
+        r = await client.post("/v1/chat/completions", json=body())
+        assert (
+            r.json()["choices"][0]["message"]["content"]
+            == "The capital of France is Paris."
+        )
+
+    async def test_repeated_sentence_openings_are_cut(self, client, backend):
+        """Second signal: looser paraphrase scores far too low on similarity to
+        act on safely, but the model keeps restarting the same sentence."""
+        backend.content = (
+            "In simple terms strings connect to each other in space. "
+            "In simple terms strings connect and form patterns together. "
+            "In simple terms strings connect and vibrate in many dimensions."
+        )
+        r = await client.post("/v1/chat/completions", json=body())
+        content = r.json()["choices"][0]["message"]["content"]
+        assert content.count("In simple terms") == 1
+
+    async def test_legitimately_similar_sentences_survive(self, client, backend):
+        """The closest legitimate pair measured scores 0.98 -- one word inverts
+        the meaning. Cutting it would silently delete correct content, which is
+        worse than leaving repetition in. The threshold sits above it."""
+        text = (
+            "This function returns the total number of active users. "
+            "This function returns the total number of inactive users."
+        )
+        backend.content = text
+        r = await client.post("/v1/chat/completions", json=body())
+        assert r.json()["choices"][0]["message"]["content"] == text
+
+    async def test_parallel_prose_survives(self, client, backend):
+        text = (
+            "The first option is to rebuild the container from scratch. "
+            "The second option is to patch the running instance in place. "
+            "The third option is to roll back entirely."
+        )
+        backend.content = text
+        r = await client.post("/v1/chat/completions", json=body())
+        assert r.json()["choices"][0]["message"]["content"] == text
+
+    async def test_ordinary_multi_sentence_answer_survives(self, client, backend):
+        text = (
+            "Gravity is the attraction between masses. It is described by "
+            "general relativity as the curvature of spacetime. On Earth it "
+            "accelerates objects at about 9.8 metres per second squared."
+        )
+        backend.content = text
+        r = await client.post("/v1/chat/completions", json=body())
+        assert r.json()["choices"][0]["message"]["content"] == text
+
+    async def test_guard_can_be_disabled(self, client, backend, settings, monkeypatch):
+        monkeypatch.setattr(settings, "echo_similarity", 0.0)
+        backend.content = self.REAL_GRAVITY
+        r = await client.post("/v1/chat/completions", json=body())
+        assert r.json()["choices"][0]["message"]["content"] == self.REAL_GRAVITY
+
+    async def test_streaming_is_guarded_too(self, client, backend):
+        backend.content = self.REAL_GRAVITY
+        frames = []
+        async with client.stream(
+            "POST", "/v1/chat/completions", json=body(stream=True)
+        ) as resp:
+            async for line in resp.aiter_lines():
+                if line.startswith("data: "):
+                    frames.append(line[6:])
+        text = "".join(
+            json.loads(f)["choices"][0]["delta"].get("content", "")
+            for f in frames if f != "[DONE]"
+        )
+        assert text.count("Gravity is a force") <= 2
+        assert frames[-1] == "[DONE]"

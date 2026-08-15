@@ -126,6 +126,7 @@ def settings(monkeypatch):
     monkeypatch.setattr(app_module.settings, "system_prompt", "TEST SYSTEM PROMPT")
     monkeypatch.setattr(app_module.settings, "loop_guard_repeats", 3)
     monkeypatch.setattr(app_module.settings, "prompt_format", "hf")
+    monkeypatch.setattr(app_module.settings, "echo_similarity", 0.99)
     return app_module.settings
 
 

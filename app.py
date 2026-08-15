@@ -8,11 +8,13 @@ construction that matches what the model was actually trained on.
 
 import asyncio
 import contextlib
+import difflib
 import hashlib
 import hmac
 import json
 import logging
 import os
+import re
 import sys
 import time
 import uuid
@@ -111,13 +113,16 @@ class Settings:
         # the model drifts into free association rather than answering; small
         # instruct models lean on a system turn to stay anchored. Set empty to
         # send nothing.
+        # Short on purpose. A longer prompt measurably degraded this model:
+        # given a five-clause instruction it began echoing the user's question
+        # back ("What is gravity? Gravity is..."), and instructions it does
+        # follow mechanically ("write END when done") derailed the answer
+        # entirely. Behavioural rules like "never repeat yourself" are enforced
+        # by the guards below, which work, rather than by asking a 2B model to
+        # police itself, which does not.
         self.system_prompt = os.environ.get(
             "BITNET_SYSTEM_PROMPT",
-            "You are a helpful, factual assistant. Answer the user's question "
-            "directly and concisely, in a few short sentences unless more "
-            "detail is clearly needed. Never repeat a sentence you have "
-            "already written. When the question is answered, stop. If you do "
-            "not know something, say you do not know.",
+            "You are a helpful assistant. Answer the question directly.",
         ).strip()
 
         # Server-side guardrail against degenerate repetition. This model can
@@ -134,6 +139,29 @@ class Settings:
             int(os.environ.get("BITNET_LOOP_GUARD_REPEATS", "4"))
             if _env_flag("BITNET_LOOP_GUARD", True)
             else 0
+        )
+
+        # Near-duplicate sentence cutoff. The loop guard below catches EXACT
+        # repeated blocks, but this model's characteristic failure is subtler:
+        # it produces a correct first sentence and then immediately restates it
+        # with one word changed -- "...towards the center of the Earth."
+        # followed by "...toward the center of the Earth." Nothing matches
+        # exactly, so neither DRY nor the exact guard fires, yet the reply was
+        # already complete after sentence one. A similarity ratio finds the
+        # restatement and cuts there.
+        #
+        # 0.99 is measured rather than chosen. Real restatements from this
+        # model score 0.99-1.00. The closest legitimate pair found scores 0.98:
+        # two sentences differing only by "active"/"inactive", where that one
+        # word IS the meaning -- cutting it would silently delete correct
+        # content, which is a worse failure than leaving repetition in. So the
+        # threshold sits above it. Looser paraphrase (~0.77) is left to the
+        # prefix rule in LoopGuard rather than dragging this down into the
+        # range where legitimate prose lives. 0 disables.
+        self.echo_similarity = (
+            float(os.environ.get("BITNET_ECHO_SIMILARITY", "0.99"))
+            if _env_flag("BITNET_ECHO_GUARD", True)
+            else 0.0
         )
 
         # Which chat template to render. "hf" is tokenizer_config.json's
@@ -765,6 +793,33 @@ class LoopGuard:
     are left to DRY, which is the sampler built for them.
     """
 
+    #: A sentence ends at .!? plus optional closing punctuation, then
+    #: whitespace, end of text, OR a capital letter with no space at all --
+    #: that last case is not an edge case here but the norm: this model fuses
+    #: its restatement straight onto the previous sentence ("...the
+    #: Earth.Gravity is a force..."), and requiring whitespace made the guard
+    #: blind to precisely the boundary it exists to find. Deliberately simple:
+    #: it locates restatement boundaries, it does not parse prose correctly.
+    SENTENCE_END = re.compile(r'[.!?]["\')\]]*(?:\s+|(?=[A-Z])|$)')
+
+    #: Below this length a "sentence" is too short to judge as a restatement --
+    #: "Yes." and "It is." legitimately recur.
+    MIN_SENTENCE = 25
+
+    #: Second, independent signal. A whole-sentence similarity ratio catches
+    #: near-exact restatement but not looser paraphrase: "String theory is a
+    #: mathematical framework that describes how strings are manipulated..."
+    #: followed by "String theory is a mathematical framework for manipulating
+    #: strings..." measures only 0.77, below any threshold safe against
+    #: legitimate prose (two real sentences differing by "active"/"inactive"
+    #: measure 0.98). What those restatements DO share is the opening: the
+    #: model keeps restarting the same sentence. Three consecutive sentences
+    #: opening with the same 25 normalised characters is degenerate; ordinary
+    #: writing, including numbered lists and parallel constructions, does not
+    #: sustain an identical opening that long three times over.
+    PREFIX_LEN = 25
+    PREFIX_RUN = 3
+
     MIN_PHRASE = 12
     # 400 rather than 200: the headline failure is the model restating its
     # ENTIRE answer verbatim, and a two-sentence answer is easily 200+ chars.
@@ -776,19 +831,30 @@ class LoopGuard:
     # (a real degenerate mode, including endless newlines) is still caught.
     LOW_DIVERSITY_MIN = 40
 
-    def __init__(self, repeats: int) -> None:
+    def __init__(self, repeats: int, echo_similarity: float = 0.0) -> None:
         # 0 disables; anything else is clamped to >=2, because repeats=1
         # would make the all() below vacuously true and abort every
         # generation at its 12th character.
         self.repeats = max(repeats, 2) if repeats else 0
+        self.echo_similarity = echo_similarity  # 0 disables
         self.text = ""
         self.tripped = False
         self._phrase = ""
+        # Set by the near-duplicate check: cut the text here rather than
+        # collapsing a repeated block.
+        self._cut_at: int | None = None
 
     def feed(self, token_text: str) -> bool:
-        """Append newly generated text; True when the loop threshold is hit."""
+        """Append newly generated text; True when either threshold is hit."""
         self.text += token_text
-        if not self.repeats or self.tripped or len(token_text) == 0:
+        if self.tripped or len(token_text) == 0:
+            return self.tripped
+        # Only worth re-scanning sentences when the new text could have closed
+        # one, which keeps this off the hot path for most tokens.
+        if self.echo_similarity and any(c in token_text for c in ".!?"):
+            if self._check_restatement():
+                return True
+        if not self.repeats:
             return self.tripped
         n = self.repeats
         limit = min(self.MAX_PHRASE, len(self.text) // n)
@@ -810,6 +876,69 @@ class LoopGuard:
                 break
         return self.tripped
 
+    def _sentences(self) -> list[tuple[int, str]]:
+        """(start_index, sentence) for each COMPLETE sentence in the text."""
+        out: list[tuple[int, str]] = []
+        start = 0
+        for m in self.SENTENCE_END.finditer(self.text):
+            sentence = self.text[start : m.end()].strip()
+            if sentence:
+                out.append((start, sentence))
+            start = m.end()
+        return out
+
+    @staticmethod
+    def _normalise(sentence: str) -> str:
+        return re.sub(r"[^a-z0-9 ]+", "", sentence.lower()).strip()
+
+    def _check_prefix_run(self, sentences: list[tuple[int, str]]) -> bool:
+        """Trip when consecutive sentences keep restarting the same way."""
+        if len(sentences) < self.PREFIX_RUN:
+            return False
+        tail = sentences[-self.PREFIX_RUN :]
+        prefixes = [self._normalise(text)[: self.PREFIX_LEN] for _, text in tail]
+        if len(prefixes[0]) < self.PREFIX_LEN:
+            return False
+        if len(set(prefixes)) != 1:
+            return False
+        self.tripped = True
+        # Keep the first of the run: it is the sentence that actually answered.
+        self._cut_at = tail[1][0]
+        logger.warning(
+            "Echo guard tripped: %d sentences opening %r; aborting generation",
+            self.PREFIX_RUN,
+            prefixes[0],
+        )
+        return True
+
+    def _check_restatement(self) -> bool:
+        """Trip when the newest complete sentence restates an earlier one."""
+        sentences = self._sentences()
+        if self._check_prefix_run(sentences):
+            return True
+        if len(sentences) < 2:
+            return False
+        start, latest = sentences[-1]
+        latest_n = self._normalise(latest)
+        if len(latest_n) < self.MIN_SENTENCE:
+            return False
+        for _, earlier in sentences[:-1]:
+            earlier_n = self._normalise(earlier)
+            if len(earlier_n) < self.MIN_SENTENCE:
+                continue
+            ratio = difflib.SequenceMatcher(None, earlier_n, latest_n).ratio()
+            if ratio >= self.echo_similarity:
+                self.tripped = True
+                self._cut_at = start
+                logger.warning(
+                    "Echo guard tripped (%.2f similar): %r restates %r",
+                    ratio,
+                    latest[:60],
+                    earlier[:60],
+                )
+                return True
+        return False
+
     def trimmed(self) -> str:
         """The text with trailing repeats collapsed to a single occurrence.
 
@@ -820,6 +949,8 @@ class LoopGuard:
         """
         if not self.tripped:
             return self.text
+        if self._cut_at is not None:
+            return self.text[: self._cut_at].rstrip()
         out = self.text
         while out.endswith(self._phrase * 2):
             out = out[: -len(self._phrase)]
@@ -847,7 +978,7 @@ async def run_completion(
     guard aborted first), and whether the guard tripped.
     """
     payload = {**payload, "stream": True}
-    guard = LoopGuard(settings.loop_guard_repeats)
+    guard = LoopGuard(settings.loop_guard_repeats, settings.echo_similarity)
     chunk_count = 0
     tokens_predicted = 0
     tokens_evaluated = 0
@@ -1019,7 +1150,7 @@ async def stream_completion(
     total = 0
     chat_id = make_chat_id()
     created = int(time.time())
-    guard = LoopGuard(settings.loop_guard_repeats)
+    guard = LoopGuard(settings.loop_guard_repeats, settings.echo_similarity)
     first_token = True
     # No read timeout while streaming: token gaps on CPU inference are long and
     # legitimate, and the slot is held for the whole duration anyway.
@@ -1259,6 +1390,8 @@ async def config(request: Request):
         "guardrails": {
             "loop_guard_repeats": settings.loop_guard_repeats,
             "loop_guard_enabled": bool(settings.loop_guard_repeats),
+            "echo_similarity": settings.echo_similarity,
+            "echo_guard_enabled": bool(settings.echo_similarity),
             "queue_timeout": settings.queue_timeout,
             "read_timeout": settings.read_timeout,
             "max_messages": settings.max_messages,
