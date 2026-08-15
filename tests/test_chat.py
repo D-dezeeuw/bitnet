@@ -510,3 +510,132 @@ class TestDefaultSystemPrompt:
             "jsonrpc": "2.0", "id": 2, "method": "tools/call",
             "params": {"name": "bitnet_chat", "arguments": {"prompt": "hi"}}})
         assert backend.last_prompt.startswith("System: TEST SYSTEM PROMPT<|eot_id|>")
+
+
+class TestLoopGuard:
+    """Server-side guardrail: the model can fail to emit any end-of-turn token
+    and restate its answer until n_predict. Sampler penalties cannot end a
+    turn, so the proxy watches the text and cuts the generation itself."""
+
+    LOOP = "The capital of France is Paris." * 10
+
+    async def test_non_streaming_reply_is_trimmed(self, client, backend):
+        backend.content = self.LOOP
+        r = await client.post("/v1/chat/completions", json=body())
+        content = r.json()["choices"][0]["message"]["content"]
+        assert "The capital of France is Paris." in content
+        # Trailing repeats collapsed; a small remainder is fine, a wall is not.
+        assert content.count("The capital of France is Paris.") < 4
+        assert r.json()["choices"][0]["finish_reason"] == "stop"
+
+    async def test_generation_is_aborted_not_just_trimmed(self, client, backend):
+        """The point is saving compute: the backend stream must be dropped
+        mid-generation, not read to the end and cleaned up after."""
+        backend.content = "spam " * 400
+        await client.post("/v1/chat/completions", json=body())
+        # The stub streams one word per chunk; if the guard aborted, the
+        # request ended long before all 400 chunks were consumed. There is no
+        # direct hook into the closed connection, but the response content
+        # bounds what was read.
+        r = await client.post("/v1/chat/completions", json=body())
+        assert len(r.json()["choices"][0]["message"]["content"]) < len(backend.content)
+
+    async def test_streaming_ends_with_a_clean_final_chunk(self, client, backend):
+        backend.content = self.LOOP
+        frames = []
+        async with client.stream(
+            "POST", "/v1/chat/completions", json=body(stream=True)
+        ) as resp:
+            async for line in resp.aiter_lines():
+                if line.startswith("data: "):
+                    frames.append(line[6:])
+        assert frames[-1] == "[DONE]"
+        reasons = [
+            json.loads(f)["choices"][0]["finish_reason"]
+            for f in frames
+            if f != "[DONE]"
+        ]
+        assert "stop" in reasons
+
+    async def test_slot_is_released_after_an_abort(self, client, backend):
+        backend.content = self.LOOP
+        await client.post("/v1/chat/completions", json=body())
+        assert (await client.get("/v1/status")).json()["busy"] is False
+
+    async def test_ordinary_prose_is_untouched(self, client, backend):
+        text = (
+            "String theory proposes that particles are tiny vibrating strings. "
+            "Different vibration patterns produce different particles. "
+            "The theory requires extra spatial dimensions to be consistent."
+        )
+        backend.content = text
+        r = await client.post("/v1/chat/completions", json=body())
+        assert r.json()["choices"][0]["message"]["content"] == text
+
+    async def test_legitimate_short_repetition_is_tolerated(self, client, backend):
+        """Two consecutive occurrences are legal prose; the guard requires
+        three. 'Location, location, location' must survive... well, almost."""
+        backend.content = "It was very, very good. It was very, very good and useful."
+        r = await client.post("/v1/chat/completions", json=body())
+        assert r.json()["choices"][0]["message"]["content"] == backend.content
+
+    async def test_guard_can_be_disabled(self, client, backend, settings, monkeypatch):
+        monkeypatch.setattr(settings, "loop_guard_repeats", 0)
+        backend.content = self.LOOP
+        r = await client.post("/v1/chat/completions", json=body())
+        assert r.json()["choices"][0]["message"]["content"] == self.LOOP
+
+    async def test_mcp_tool_is_guarded_too(self, client, backend, settings, monkeypatch):
+        monkeypatch.setattr(settings, "api_key", "k")
+        backend.content = self.LOOP
+        h = {"Content-Type": "application/json",
+             "Accept": "application/json, text/event-stream"}
+        await client.post("/mcp?key=k", headers=h, json={
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                       "clientInfo": {"name": "t", "version": "1"}}})
+        r = await client.post("/mcp?key=k", headers=h, json={
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "bitnet_chat", "arguments": {"prompt": "hi"}}})
+        assert r.text.count("The capital of France is Paris.") < 4
+
+
+class TestLeadingSpaceStrip:
+    """The generation prompt no longer carries the boundary space; the model's
+    first token supplies it, and it is formatting rather than content."""
+
+    async def test_fresh_reply_leading_space_is_stripped(self, client, backend):
+        backend.content = " Hello there"
+        r = await client.post("/v1/chat/completions", json=body())
+        assert r.json()["choices"][0]["message"]["content"] == "Hello there"
+
+    async def test_only_one_space_is_stripped(self, client, backend):
+        backend.content = "  indented"
+        r = await client.post("/v1/chat/completions", json=body())
+        assert r.json()["choices"][0]["message"]["content"] == " indented"
+
+    async def test_continuation_keeps_its_leading_space(self, client, backend):
+        """Mid-sentence resumption: the next token's leading space is real."""
+        backend.content = " continues here"
+        r = await client.post(
+            "/v1/chat/completions",
+            json={
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": "The reply"},
+                ],
+                "continuation": True,
+            },
+        )
+        assert r.json()["choices"][0]["message"]["content"] == " continues here"
+
+    async def test_streaming_strips_the_first_token_space(self, client, backend):
+        backend.content = " alpha beta"
+        text = ""
+        async with client.stream(
+            "POST", "/v1/chat/completions", json=body(stream=True)
+        ) as resp:
+            async for line in resp.aiter_lines():
+                if line.startswith("data: ") and line[6:] != "[DONE]":
+                    text += json.loads(line[6:])["choices"][0]["delta"].get("content", "")
+        assert text == "alpha beta"

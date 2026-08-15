@@ -51,10 +51,26 @@ class StubBackend:
         return self.requests[-1]["prompt"] if self.requests else None
 
     async def _sse(self) -> AsyncIterator[bytes]:
-        for token in self.content.split(" "):
-            chunk = {"content": token + " ", "stop": False}
+        # Emit tokens the way the real backend does: the space that separates
+        # words rides on the FRONT of the following token (" beta"), not the
+        # back of the preceding one. Reassembling the pieces reproduces
+        # self.content exactly, and a content set with a leading space
+        # exercises the API's first-token strip.
+        pieces = self.content.split(" ")
+        tokens = [pieces[0]] + [" " + p for p in pieces[1:]]
+        for token in tokens:
+            chunk = {"content": token, "stop": False}
             yield f"data: {json.dumps(chunk)}\n\n".encode()
-        final = {"content": "", "stop": True, **self._stop_fields()}
+        # The final chunk carries empty content plus the authoritative counts,
+        # matching the pinned backend (content only accompanies non-streaming
+        # responses there).
+        final = {
+            "content": "",
+            "stop": True,
+            "tokens_predicted": self.tokens_predicted,
+            "tokens_evaluated": self.tokens_evaluated,
+            **self._stop_fields(),
+        }
         yield f"data: {json.dumps(final)}\n\n".encode()
         yield b"data: [DONE]\n\n"
 
@@ -103,6 +119,8 @@ def settings(monkeypatch):
     monkeypatch.setattr(app_module.settings, "temperature", 0.3)
     monkeypatch.setattr(app_module.settings, "min_p", 0.1)
     monkeypatch.setattr(app_module.settings, "system_prompt", "TEST SYSTEM PROMPT")
+    monkeypatch.setattr(app_module.settings, "loop_guard_repeats", 3)
+    monkeypatch.setattr(app_module.settings, "prompt_format", "hf")
     return app_module.settings
 
 

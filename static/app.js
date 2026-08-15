@@ -27,6 +27,7 @@ const KEEP_RECENT = 8;
 // Served by /v1/status rather than hardcoded, so changing BITNET_CTX_SIZE can
 // never leave the context bar quietly lying about the real limit.
 let CTX_LIMIT = 4096;
+let DEFAULT_SYSTEM_PROMPT = '';
 
 let history = [];
 let isCompacting = false;
@@ -132,7 +133,14 @@ async function compactHistory(auto) {
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const data = await res.json();
     const summaryText = data.summary || '[Summary unavailable]';
-    history = [{ role: 'system', content: 'Context summary: ' + summaryText }, ...toKeep];
+    // The summary rides in a system message, which makes the server treat the
+    // request as "caller supplied a system prompt" and skip its default
+    // framing. Re-attach that framing here (fetched from /v1/status) unless
+    // the user typed their own, so the anti-rambling anchor survives
+    // compaction instead of vanishing exactly when conversations get long.
+    const ownSystem = systemPromptEl.value.trim();
+    const framing = (!ownSystem && DEFAULT_SYSTEM_PROMPT) ? DEFAULT_SYSTEM_PROMPT + '\n\n' : '';
+    history = [{ role: 'system', content: framing + 'Context summary: ' + summaryText }, ...toKeep];
     renderHistory();
     updateCtxBar();
     updateMeta((auto ? 'Auto-compacted' : 'Compacted') + ': ' + beforeCount + ' -> ' +
@@ -179,7 +187,7 @@ async function pollBusy() {
 /* ---------- streaming ---------- */
 
 async function streamResponse(el, existingText, isContinuation) {
-  const maxTokens = parseInt(maxTokensEl.value, 10) || 1024;
+  const maxTokens = parseInt(maxTokensEl.value, 10) || 256;
   if (estimateTokens(buildMessages()) + maxTokens > CTX_LIMIT && history.length > KEEP_RECENT + 1) {
     await compactHistory(true);
   }
@@ -200,9 +208,11 @@ async function streamResponse(el, existingText, isContinuation) {
       messages: buildMessages(),
       stream: true,
       temperature: isNaN(tempVal) ? 0.3 : tempVal,
-      top_p: isNaN(topPVal) ? 0.9 : topPVal,
       max_tokens: maxTokens
     };
+    // top_p only when the user set one: always sending it overlays the
+    // server's min_p-first sampling with a second truncation.
+    if (!isNaN(topPVal)) body.top_p = topPVal;
     if (stopSeqs && stopSeqs.length) body.stop = stopSeqs;
     // Resume the trailing assistant turn rather than opening a new one.
     if (isContinuation) body.continuation = true;
@@ -365,6 +375,7 @@ async function bootstrap() {
     const data = await res.json();
     if (data.context_size) CTX_LIMIT = data.context_size;
     if (data.max_tokens_cap) maxTokensEl.max = String(data.max_tokens_cap);
+    if (data.default_system_prompt) DEFAULT_SYSTEM_PROMPT = data.default_system_prompt;
     if (data.auth_required) {
       // A valid session cookie makes an authenticated route succeed.
       const probe = await fetch('/v1/models');

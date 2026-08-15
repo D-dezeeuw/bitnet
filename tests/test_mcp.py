@@ -188,7 +188,7 @@ async def test_chat_tool_builds_the_same_prompt_as_the_rest_api(
     await call_tool(client, keyed, "bitnet_chat", {"prompt": "Hi"})
     prompt = backend.last_prompt
     assert "User: Hi<|eot_id|>" in prompt
-    assert prompt.endswith("Assistant: ")
+    assert prompt.endswith("Assistant:")
 
 
 @pytest.mark.asyncio

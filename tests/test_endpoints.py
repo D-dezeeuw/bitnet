@@ -86,3 +86,11 @@ async def test_root_redirects_to_the_ui(client):
     r = await client.get("/", follow_redirects=False)
     assert r.status_code in (307, 308)
     assert r.headers["location"] == "/inference"
+
+
+async def test_status_serves_the_default_system_prompt(client, settings):
+    """The UI needs it to keep the framing prompt alive through compaction:
+    the compaction summary is a system message, which would otherwise
+    suppress the default exactly when conversations get long."""
+    data = (await client.get("/v1/status")).json()
+    assert data["default_system_prompt"] == settings.system_prompt

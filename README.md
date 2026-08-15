@@ -135,7 +135,10 @@ User: hi<|eot_id|>Assistant: hello<|eot_id|>Assistant:
 ```
 
 Roles are capitalized, turns are separated by `<|eot_id|>` with no newline, and
-the generation prompt is `Assistant: ` with a trailing space.
+the generation prompt is `Assistant:` with **no trailing space** — the bare
+space would encode as a standalone token the model never saw at that boundary
+in training; the model emits the reply's leading space itself and the API
+strips it.
 
 This is deliberately **not** delegated to llama-server's own
 `/v1/chat/completions`. The chat template embedded in `ggml-model-i2_s.gguf` is
@@ -148,15 +151,39 @@ trained turn terminator is `<|eot_id|>`. llama-server's automatic EOS stop
 therefore never fires at end of turn, which is why `<|eot_id|>` is passed as an
 explicit stop sequence.
 
-That stop sequence is a *string*, and it only matches because `entrypoint.sh`
-starts llama-server with `--special`, which renders special tokens into the
-output text. Without that flag the server renders `<|eot_id|>` as empty text:
-the model ends its turn, nothing stops, and it is forced to keep generating —
-so it restarts and restates its answer until `n_predict` runs out. That was the
-cause of every "model loops forever" report against this deployment; the
-visible tell was sentences fused without a space (`universe.String theory is`),
-which is where the invisible token was dropped. No sampler setting can fix a
-stop that never fires.
+On the pinned backend the string stops are belt-and-braces rather than
+load-bearing: the vendored llama.cpp force-adds `<|eot_id|>` and
+`<|end_of_text|>` to its end-of-generation set by token text and stops at
+token level, despite the incomplete GGUF metadata (which declares only
+`<|end_of_text|>` as eos, where the HF repo's `generation_config.json` lists
+both — the conversion simply lost the second stop token).
+
+The deeper finding, established by probing the deployment: when output runs to
+`n_predict` and loops, the quantised model **emitted no end-of-turn token at
+all**. No stop configuration can fix that — which is why the API carries a
+loop guard (below).
+
+### Known weaknesses and guardrails
+
+A 1.58-bit 2B model fails in characteristic ways. Each has a server-side
+guardrail:
+
+| Weakness | Guardrail |
+|---|---|
+| Never emits an end-of-turn token on open-ended prompts, restating its answer to the token cap | **Loop guard**: the proxy watches generated text; a phrase repeated `BITNET_LOOP_GUARD_REPEATS` (3) times consecutively aborts the backend generation (freeing the slot), trims the repeats, and finishes cleanly. `BITNET_LOOP_GUARD=0` disables. |
+| Word-substituted restatements ("simple/easy/clear") | DRY sampling (`BITNET_DRY_MULTIPLIER=0.8`), the n-gram penalty built for it |
+| Rambles without framing | Default system prompt, applied when the caller sends none; kept alive through UI context compaction |
+| Degenerate start from an out-of-distribution boundary token | The generation prompt ends at `Assistant:` with no trailing space; the model supplies the reply's leading space and the API strips it |
+| Fragile under lively sampling | `temperature` 0.3, `min_p` 0.1 defaults; the UI no longer force-sends `top_p` |
+
+Two chat templates exist for this model because Microsoft shipped two: the HF
+`tokenizer_config.json` one (default, `User:`/`Assistant:` with `<|eot_id|>`)
+and the one their conversion script embedded in the GGUF itself
+(`Human:`/`BITNETAssistant:` with blank lines and `<|end_of_text|>`), which is
+what their demo effectively runs. `BITNET_PROMPT_FORMAT=bitnet` switches to
+the latter — an A/B worth running if reply quality stays poor, since which
+template this quantised checkpoint answers better under is an empirical
+question.
 
 ## Architecture
 
@@ -266,6 +293,9 @@ open to anything that can reach the container on the proxy network.
 | `BITNET_TEMPERATURE` | `0.3` | Default sampling temperature |
 | `BITNET_MIN_P` | `0.1` | Minimum relative token probability |
 | `BITNET_SYSTEM_PROMPT` | _(see below)_ | Prepended when the caller sends none; empty disables |
+| `BITNET_LOOP_GUARD` | `1` | Server-side repetition cutoff; `0` disables |
+| `BITNET_LOOP_GUARD_REPEATS` | `3` | Consecutive phrase repeats that trigger the cutoff |
+| `BITNET_PROMPT_FORMAT` | `hf` | Chat template: `hf` (tokenizer_config) or `bitnet` (GGUF-embedded) |
 | `BITNET_DRY_BASE` | `1.75` | DRY growth base |
 | `BITNET_DRY_ALLOWED_LENGTH` | `2` | N-gram length DRY tolerates before penalising |
 | `BITNET_QUEUE_TIMEOUT` | `3` | Seconds to wait for the inference slot before `503` |

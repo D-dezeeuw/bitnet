@@ -27,6 +27,7 @@ from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import BaseModel, Field, ValidationError
+from starlette.background import BackgroundTask
 
 from mcp_server import MCPDispatch, build_mcp_server
 
@@ -112,9 +113,38 @@ class Settings:
         # send nothing.
         self.system_prompt = os.environ.get(
             "BITNET_SYSTEM_PROMPT",
-            "You are a helpful assistant. Answer accurately and concisely. "
-            "If you do not know something, say so rather than guessing.",
+            "You are a helpful, factual assistant. Answer the user's question "
+            "directly and concisely, in a few short sentences unless more "
+            "detail is clearly needed. Never repeat a sentence you have "
+            "already written. When the question is answered, stop. If you do "
+            "not know something, say you do not know.",
         ).strip()
+
+        # Server-side guardrail against degenerate repetition. This model can
+        # fail to emit any end-of-turn token and then restate its answer until
+        # n_predict; the guard watches the generated text, and when a phrase
+        # repeats this many times consecutively it aborts the backend request
+        # (the pinned llama-server polls for disconnect and frees its slot),
+        # trims the repeats, and finishes the response cleanly. 0 disables.
+        self.loop_guard_repeats = (
+            int(os.environ.get("BITNET_LOOP_GUARD_REPEATS", "3"))
+            if _env_flag("BITNET_LOOP_GUARD", True)
+            else 0
+        )
+
+        # Which chat template to render. "hf" is tokenizer_config.json's
+        # (User:/Assistant: with <|eot_id|> terminators) -- the documented
+        # format for the instruct weights. "bitnet" is the template Microsoft's
+        # own GGUF conversion script embeds in the file (Human:/BITNETAssistant:
+        # with blank lines and <|end_of_text|> terminators) and what their demo
+        # effectively uses. The two disagree; which one this quantised
+        # checkpoint actually answers better under is an empirical question,
+        # so it is a deploy-time switch rather than a hardcode.
+        fmt = os.environ.get("BITNET_PROMPT_FORMAT", "hf").strip().lower()
+        if fmt not in ("hf", "bitnet"):
+            logger.warning("Unknown BITNET_PROMPT_FORMAT %r; using 'hf'", fmt)
+            fmt = "hf"
+        self.prompt_format = fmt
 
         # Pre-MDL-1 the prompt carried no turn separators, so generation had to
         # be stopped by string-matching "User:". That truncated any reply which
@@ -146,18 +176,31 @@ settings = Settings()
 # crowding out the reply; the backend enforces the real limit.
 CHARS_PER_TOKEN = 3.5
 
-# Turn terminator the model was trained to emit. Note the GGUF declares
-# eos_token as <|end_of_text|>, NOT this, so llama-server's automatic EOS stop
-# never fires at end of turn -- listing it explicitly is required, not a hack.
+# End-of-turn handling, established against the pinned backend rather than
+# assumed (the llama.cpp fork vendored by the BitNet commit in the Dockerfile):
 #
-# This string stop only works because entrypoint.sh starts llama-server with
-# --special, which renders special tokens into the output text. Without that
-# flag <|eot_id|> renders as empty text, the string never matches, and the
-# model -- which did end its turn -- is forced onward and loops, restating its
-# answer until n_predict. Remove --special and every reply degrades that way.
+# - The GGUF's metadata is incomplete: it declares eos as <|end_of_text|>
+#   (128001) and carries no eot key, while the HF repo's generation_config
+#   stops on BOTH 128001 and <|eot_id|> (128009).
+# - The pinned llama.cpp neutralises that itself: llama-vocab.cpp force-adds
+#   "<|eot_id|>" and "<|end_of_text|>" to its end-of-generation set BY TOKEN
+#   TEXT, and the server stops at token level on either. This needs neither
+#   --special nor these string stops.
+# - The strings below are therefore belt-and-braces for other backends, not
+#   the mechanism. When output still runs to n_predict, the model failed to
+#   EMIT an end token at all -- no stop configuration can fix that, which is
+#   what LoopGuard below is for.
 EOT = "<|eot_id|>"
-GENERATION_PROMPT = "Assistant: "
-DEFAULT_STOPS = [EOT, "<|end_of_text|>"]
+END_OF_TEXT = "<|end_of_text|>"
+
+# No trailing space, deliberately. "Assistant: " encodes the bare space as a
+# standalone token, but in training text that space is merged into the reply's
+# first token (" Sure"). Conditioning a 1.58-bit model on that out-of-
+# distribution boundary token is a credible degenerate-start trigger. The model
+# emits the leading space itself now, and the API strips it from the first
+# token of a fresh (non-continuation) reply.
+GENERATION_PROMPT = "Assistant:"
+DEFAULT_STOPS = [EOT, END_OF_TEXT]
 ROLE_STOP_FALLBACK = ["User:", "user:"]
 
 SESSION_COOKIE = "bitnet_session"
@@ -405,27 +448,74 @@ class SummarizeRequest(BaseModel):
 
 
 def build_prompt(messages: list[Message], *, continuation: bool = False) -> str:
-    """Render messages using the model's real chat template.
+    """Render messages in the configured chat template.
 
-    Mirrors tokenizer_config.json from microsoft/bitnet-b1.58-2B-4T:
+    "hf" mirrors tokenizer_config.json from microsoft/bitnet-b1.58-2B-4T:
 
-        {role|capitalize}: {content|trim}<|eot_id|> ... then "Assistant: "
+        {role|capitalize}: {content|trim}<|eot_id|> ... then "Assistant:"
 
-    Deliberately NOT delegated to llama-server's /v1/chat/completions: the
-    template embedded in ggml-model-i2_s.gguf is mangled (it emits "Human:" and
-    "BITNETAssistant:", places eos_token after the generation prompt, and drops
-    system messages), so the backend would apply a worse format than this.
+    "bitnet" mirrors the template embedded in the GGUF itself (written by
+    Microsoft's conversion script and used by their own demo):
 
-    BOS is not prepended -- llama-server adds it from add_bos_token metadata.
+        Human: {content}\n\nBITNETAssistant: {reply}<|end_of_text|> ...
+
+    with two deliberate repairs to that template: the eos_token it appends
+    directly after the generation prompt is dropped (generating after an eos
+    is nonsensical -- a conversion-script bug), and a system message, which it
+    has no branch for, is folded into the first user turn.
+
+    Neither format ends with a trailing space: the model emits the reply's
+    leading space itself (see GENERATION_PROMPT). BOS is not prepended --
+    llama-server adds it from add_bos_token metadata.
     """
+    if settings.prompt_format == "bitnet":
+        return _build_prompt_bitnet(messages, continuation=continuation)
+
     if continuation and messages and messages[-1].role == "assistant":
         head = "".join(
             f"{m.role.capitalize()}: {m.content.strip()}{EOT}" for m in messages[:-1]
         )
-        # lstrip only: a trailing space in the partial is a real token boundary.
-        return head + GENERATION_PROMPT + messages[-1].content.lstrip()
+        # The space the fresh path omits is re-added here: tokenizing
+        # "Assistant: partial" in one string BPE-merges " partial" exactly as
+        # training did, so the continuation path stays in-distribution.
+        return head + GENERATION_PROMPT + " " + messages[-1].content.lstrip()
     body = "".join(f"{m.role.capitalize()}: {m.content.strip()}{EOT}" for m in messages)
     return body + GENERATION_PROMPT
+
+
+BITNET_GENERATION_PROMPT = "BITNETAssistant:"
+
+
+def _build_prompt_bitnet(
+    messages: list[Message], *, continuation: bool = False
+) -> str:
+    """Render the GGUF-embedded template. See build_prompt for the repairs."""
+    msgs = list(messages)
+    system = ""
+    if msgs and msgs[0].role == "system":
+        system = msgs[0].content.strip()
+        msgs = msgs[1:]
+
+    partial: str | None = None
+    if continuation and msgs and msgs[-1].role == "assistant":
+        partial = msgs[-1].content.lstrip()
+        msgs = msgs[:-1]
+
+    parts: list[str] = []
+    first_user = True
+    for m in msgs:
+        if m.role == "user":
+            content = m.content.strip()
+            if system and first_user:
+                content = f"{system}\n\n{content}"
+            first_user = False
+            parts.append(f"Human: {content}\n\n{BITNET_GENERATION_PROMPT}")
+        elif m.role == "assistant":
+            parts.append(f" {m.content.strip()}{END_OF_TEXT}")
+    prompt = "".join(parts)
+    if partial is not None:
+        prompt += " " + partial
+    return prompt
 
 
 def with_default_system(messages: list[Message], max_tokens: int) -> list[Message]:
@@ -597,12 +687,147 @@ def finish_reason_from(data: dict) -> Literal["length", "stop"]:
 
 def _backend_error(exc: Exception) -> HTTPException:
     if isinstance(exc, httpx.HTTPStatusError):
+        try:
+            body = exc.response.text
+        except httpx.ResponseNotRead:  # streaming response never read
+            body = "<unread streaming body>"
         logger.error(
-            "llama-server returned %s: %s", exc.response.status_code, exc.response.text
+            "llama-server returned %s: %s", exc.response.status_code, body
         )
         return HTTPException(status_code=502, detail="Inference backend error")
     logger.error("llama-server unavailable: %s", exc)
     return HTTPException(status_code=503, detail="Inference backend unavailable")
+
+
+class LoopGuard:
+    """Detects and trims degenerate repetition in generated text.
+
+    The failure this exists for: the model emits no end-of-turn token and
+    restates its answer -- verbatim or lightly mutated -- until n_predict.
+    Sampler penalties cannot end a turn (they only demote tokens already
+    seen; they cannot promote an end token the model is not producing), so
+    the proxy has to be able to cut the generation itself.
+
+    Detection is deliberately conservative: it trips only when the text ENDS
+    with the same block of at least MIN_PHRASE characters repeated `repeats`
+    times consecutively. Legitimate prose almost never does that; degenerate
+    loops always eventually do. Mutated loops (word-substituted restatements)
+    are left to DRY, which is the sampler built for them.
+    """
+
+    MIN_PHRASE = 12
+    MAX_PHRASE = 200
+
+    def __init__(self, repeats: int) -> None:
+        self.repeats = repeats  # 0 disables
+        self.text = ""
+        self.tripped = False
+        self._phrase = ""
+
+    def feed(self, token_text: str) -> bool:
+        """Append newly generated text; True when the loop threshold is hit."""
+        self.text += token_text
+        if not self.repeats or self.tripped or len(token_text) == 0:
+            return self.tripped
+        n = self.repeats
+        limit = min(self.MAX_PHRASE, len(self.text) // n)
+        for size in range(self.MIN_PHRASE, limit + 1):
+            block = self.text[-size:]
+            if not block.strip():
+                continue
+            if all(
+                self.text[-(i + 1) * size : len(self.text) - i * size] == block
+                for i in range(1, n)
+            ):
+                self.tripped = True
+                self._phrase = block
+                logger.warning(
+                    "Loop guard tripped: %r repeated %dx; aborting generation",
+                    block[:60],
+                    n,
+                )
+                break
+        return self.tripped
+
+    def trimmed(self) -> str:
+        """The text with trailing repeats collapsed to a single occurrence."""
+        if not self.tripped:
+            return self.text
+        out = self.text
+        while out.endswith(self._phrase * 2):
+            out = out[: -len(self._phrase)]
+        return out
+
+
+async def run_completion(
+    state, payload: dict, *, strip_leading_space: bool
+) -> dict:
+    """Run one completion against llama-server, streaming backend-side.
+
+    Every non-streaming caller goes through here rather than client.post, for
+    one reason: the loop guard can only save compute if it sees text as it is
+    generated. On a guard trip the stream context is exited early, httpx
+    closes the connection, and the pinned llama-server polls for disconnect
+    and frees its single slot -- so a runaway generation costs seconds, not
+    the full n_predict budget.
+
+    Returns content, finish_reason, token counts (from the backend's final
+    chunk when generation completed; estimated from chunk count when the
+    guard aborted first), and whether the guard tripped.
+    """
+    payload = {**payload, "stream": True}
+    guard = LoopGuard(settings.loop_guard_repeats)
+    chunk_count = 0
+    tokens_predicted = 0
+    tokens_evaluated = 0
+    finish_reason: str = "stop"
+    stream_timeout = httpx.Timeout(
+        connect=settings.connect_timeout,
+        read=settings.read_timeout,
+        write=30.0,
+        pool=30.0,
+    )
+    try:
+        async with state.client.stream(
+            "POST", "/completion", json=payload, timeout=stream_timeout
+        ) as resp:
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                raw = line[6:]
+                if raw.strip() == "[DONE]":
+                    break
+                chunk = json.loads(raw)
+                if chunk.get("stop", False):
+                    # Final chunk: authoritative counts and stop reason. Its
+                    # content is empty on this backend; do not feed the guard.
+                    tokens_predicted = chunk.get("tokens_predicted", chunk_count)
+                    tokens_evaluated = chunk.get("tokens_evaluated", 0)
+                    finish_reason = finish_reason_from(chunk)
+                    break
+                chunk_count += 1
+                if guard.feed(chunk.get("content", "")):
+                    # Exiting the context closes the connection; the backend
+                    # cancels the generation and frees its slot.
+                    finish_reason = "stop"
+                    tokens_predicted = chunk_count
+                    break
+    except (httpx.HTTPStatusError, httpx.RequestError) as exc:
+        raise _backend_error(exc) from exc
+
+    content = guard.trimmed()
+    if strip_leading_space and content.startswith(" "):
+        # The generation prompt no longer carries the boundary space, so the
+        # model's first token supplies it; it is formatting, not content.
+        content = content[1:]
+    return {
+        "content": content,
+        "finish_reason": finish_reason,
+        "tokens_predicted": tokens_predicted,
+        "tokens_evaluated": tokens_evaluated,
+        "guard_tripped": guard.tripped,
+    }
 
 
 # --------------------------------------------------------------------------
@@ -637,27 +862,27 @@ async def chat_completion(req: ChatRequest, request: Request):
 
     if req.stream:
         return StreamingResponse(
-            stream_completion(request, payload, slot),
+            stream_completion(request, payload, slot, req.continuation),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            # Belt-and-braces slot release: if the generator is never iterated
+            # (setup failure before the first chunk), its finally never runs.
+            # Release is idempotent, so double-running is harmless.
+            background=BackgroundTask(slot.release),
         )
 
     try:
         start = time.time()
-        try:
-            resp = await request.app.state.client.post("/completion", json=payload)
-            resp.raise_for_status()
-        except (httpx.HTTPStatusError, httpx.RequestError) as exc:
-            raise _backend_error(exc) from exc
-        data = resp.json()
+        result = await run_completion(
+            request.app.state, payload, strip_leading_space=not req.continuation
+        )
     finally:
         slot.release()
 
-    content = data.get("content", "")
-    tokens_predicted = data.get("tokens_predicted", 0)
-    tokens_evaluated = data.get("tokens_evaluated", 0)
-    # Report what actually happened rather than always claiming "stop".
-    finish_reason = finish_reason_from(data)
+    content = result["content"]
+    tokens_predicted = result["tokens_predicted"]
+    tokens_evaluated = result["tokens_evaluated"]
+    finish_reason = result["finish_reason"]
     logger.info(
         "Chat response: %d chars in %dms (%s)",
         len(content),
@@ -685,12 +910,14 @@ async def chat_completion(req: ChatRequest, request: Request):
 
 
 async def stream_completion(
-    request: Request, payload: dict, slot: Slot
+    request: Request, payload: dict, slot: Slot, continuation: bool = False
 ) -> AsyncIterator[str]:
     start = time.time()
     total = 0
     chat_id = make_chat_id()
     created = int(time.time())
+    guard = LoopGuard(settings.loop_guard_repeats)
+    first_token = True
     # No read timeout while streaming: token gaps on CPU inference are long and
     # legitimate, and the slot is held for the whole duration anyway.
     stream_timeout = httpx.Timeout(
@@ -710,10 +937,21 @@ async def stream_completion(
                 chunk = json.loads(raw)
                 token = chunk.get("content", "")
                 stop = chunk.get("stop", False)
+                if first_token and token:
+                    if not continuation and token.startswith(" "):
+                        token = token[1:]
+                    first_token = False
                 total += len(token)
                 finish_reason = None
                 if stop:
                     finish_reason = finish_reason_from(chunk)
+                elif guard.feed(token):
+                    # Repetition already streamed cannot be unsent, but the
+                    # generation is cut here: dropping out of the stream
+                    # context closes the connection and the backend frees its
+                    # slot. The client sees a clean final chunk.
+                    stop = True
+                    finish_reason = "stop"
                 sse = {
                     "id": chat_id,
                     "object": "chat.completion.chunk",
@@ -778,16 +1016,13 @@ async def summarize_context(req: SummarizeRequest, request: Request):
 
     slot = await acquire_slot(request.app.state.inference_lock)
     try:
-        try:
-            resp = await request.app.state.client.post("/completion", json=payload)
-            resp.raise_for_status()
-        except (httpx.HTTPStatusError, httpx.RequestError) as exc:
-            raise _backend_error(exc) from exc
-        data = resp.json()
+        result = await run_completion(
+            request.app.state, payload, strip_leading_space=True
+        )
     finally:
         slot.release()
 
-    summary = data.get("content", "").strip()
+    summary = result["content"].strip()
     logger.info("Summary generated: %d chars", len(summary))
     return {"summary": summary}
 
@@ -856,6 +1091,11 @@ async def status(request: Request):
         "context_size": settings.ctx_size,
         "max_tokens_cap": settings.max_tokens_cap,
         "auth_required": bool(settings.api_key),
+        # Served so the UI can keep the framing prompt alive through context
+        # compaction: the compaction summary is a system message, which would
+        # otherwise silently suppress this default exactly when conversations
+        # get long.
+        "default_system_prompt": settings.system_prompt,
     }
 
 
@@ -943,17 +1183,17 @@ async def _mcp_generate(
     slot = await acquire_slot(app.state.inference_lock)
     try:
         try:
-            resp = await app.state.client.post("/completion", json=payload)
-            resp.raise_for_status()
-        except (httpx.HTTPStatusError, httpx.RequestError) as exc:
-            raise ValueError(f"BitNet backend unavailable: {exc}") from exc
-        data = resp.json()
+            result = await run_completion(
+                app.state, payload, strip_leading_space=True
+            )
+        except HTTPException as exc:
+            raise ValueError(f"BitNet backend unavailable: {exc.detail}") from exc
     finally:
         slot.release()
 
     return {
-        "content": data.get("content", ""),
-        "finish_reason": finish_reason_from(data),
+        "content": result["content"],
+        "finish_reason": result["finish_reason"],
     }
 
 

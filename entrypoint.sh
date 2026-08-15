@@ -21,14 +21,16 @@ echo "Starting llama-server on internal port $PORT (threads=$THREADS ctx=$CTX)..
 # the default slot count were ever above 1 each slot would silently get a
 # fraction of CTX and the API would advertise a context it does not have.
 #
-# --special is load-bearing, not cosmetic. The model ends its turn by emitting
-# <|eot_id|>, but the GGUF declares eos as <|end_of_text|>, so that token does
-# not auto-stop generation; the API stops on the STRING "<|eot_id|>" instead.
-# Without --special the server renders special tokens as empty text, so the
-# string never appears, the stop never fires, and generation runs to n_predict
-# -- the model restarts its turn and loops, restating the answer until the
-# token budget is gone. The tell was sentences fused without a space
-# ("universe.String theory is"): the invisible dropped token between them.
+# --special makes the server render any special tokens the model emits as
+# text, where the API's string stops can match them. On the PINNED backend it
+# is belt-and-braces rather than load-bearing: this llama.cpp revision
+# force-adds "<|eot_id|>" and "<|end_of_text|>" to its end-of-generation set
+# by token text (llama-vocab.cpp) and stops at token level, despite the GGUF
+# metadata declaring only <|end_of_text|> as eos. An earlier comment here
+# claimed --special was the fix for the model looping; live probing disproved
+# that -- when output loops to n_predict, the model emitted no end token at
+# all, which no stop configuration can fix. The API's loop guard handles that
+# case.
 llama-server \
     -m "$MODEL" \
     --port "$PORT" \
