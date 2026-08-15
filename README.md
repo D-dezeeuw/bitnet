@@ -170,7 +170,7 @@ guardrail:
 
 | Weakness | Guardrail |
 |---|---|
-| Never emits an end-of-turn token on open-ended prompts, restating its answer to the token cap | **Loop guard**: the proxy watches generated text; a phrase repeated `BITNET_LOOP_GUARD_REPEATS` (3) times consecutively aborts the backend generation (freeing the slot), trims the repeats, and finishes cleanly. `BITNET_LOOP_GUARD=0` disables. |
+| Never emits an end-of-turn token on open-ended prompts, restating its answer to the token cap | **Loop guard**: the proxy watches generated text; a phrase repeated `BITNET_LOOP_GUARD_REPEATS` (4) times consecutively aborts the backend generation (freeing the slot), trims the repeats, and finishes cleanly. `BITNET_LOOP_GUARD=0` disables. |
 | Word-substituted restatements ("simple/easy/clear") | DRY sampling (`BITNET_DRY_MULTIPLIER=0.8`), the n-gram penalty built for it |
 | Rambles without framing | Default system prompt, applied when the caller sends none; kept alive through UI context compaction |
 | Degenerate start from an out-of-distribution boundary token | The generation prompt ends at `Assistant:` with no trailing space; the model supplies the reply's leading space and the API strips it |
@@ -294,7 +294,7 @@ open to anything that can reach the container on the proxy network.
 | `BITNET_MIN_P` | `0.1` | Minimum relative token probability |
 | `BITNET_SYSTEM_PROMPT` | _(see below)_ | Prepended when the caller sends none; empty disables |
 | `BITNET_LOOP_GUARD` | `1` | Server-side repetition cutoff; `0` disables |
-| `BITNET_LOOP_GUARD_REPEATS` | `3` | Consecutive phrase repeats that trigger the cutoff |
+| `BITNET_LOOP_GUARD_REPEATS` | `4` | Consecutive phrase repeats that trigger the cutoff (min 2; single-character runs use a higher bar so banners and rules survive) |
 | `BITNET_PROMPT_FORMAT` | `hf` | Chat template: `hf` (tokenizer_config) or `bitnet` (GGUF-embedded) |
 | `BITNET_DRY_BASE` | `1.75` | DRY growth base |
 | `BITNET_DRY_ALLOWED_LENGTH` | `2` | N-gram length DRY tolerates before penalising |

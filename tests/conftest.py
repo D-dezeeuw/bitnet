@@ -37,6 +37,9 @@ class StubBackend:
         self.delay = 0.0
         self.status_code = 200
         self.unavailable = False
+        # End the SSE stream WITHOUT the final counts chunk, simulating a
+        # backend that died mid-generation with a clean connection close.
+        self.truncate_stream = False
 
     def _stop_fields(self) -> dict:
         out: dict = {}
@@ -61,6 +64,8 @@ class StubBackend:
         for token in tokens:
             chunk = {"content": token, "stop": False}
             yield f"data: {json.dumps(chunk)}\n\n".encode()
+        if self.truncate_stream:
+            return
         # The final chunk carries empty content plus the authoritative counts,
         # matching the pinned backend (content only accompanies non-streaming
         # responses there).

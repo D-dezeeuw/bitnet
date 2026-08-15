@@ -138,6 +138,16 @@ async function compactHistory(auto) {
     // framing. Re-attach that framing here (fetched from /v1/status) unless
     // the user typed their own, so the anti-rambling anchor survives
     // compaction instead of vanishing exactly when conversations get long.
+    // default_system_prompt is only served to authorized callers, and
+    // bootstrap may have run before the session cookie existed -- refetch
+    // once, now that compaction proves we are authenticated.
+    if (!DEFAULT_SYSTEM_PROMPT) {
+      try {
+        const sres = await fetch('/v1/status');
+        const sdata = await sres.json();
+        if (sdata.default_system_prompt) DEFAULT_SYSTEM_PROMPT = sdata.default_system_prompt;
+      } catch { /* framing is an enhancement, not a requirement */ }
+    }
     const ownSystem = systemPromptEl.value.trim();
     const framing = (!ownSystem && DEFAULT_SYSTEM_PROMPT) ? DEFAULT_SYSTEM_PROMPT + '\n\n' : '';
     history = [{ role: 'system', content: framing + 'Context summary: ' + summaryText }, ...toKeep];

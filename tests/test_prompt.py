@@ -132,3 +132,38 @@ class TestBitnetFormat:
             msgs(("user", "hi"), ("assistant", "partial")), continuation=True
         )
         assert prompt == "Human: hi\n\nBITNETAssistant: partial"
+
+
+class TestBitnetFormatReviewFindings:
+    """Defects the adversarial review confirmed in the first renderer."""
+
+    @pytest.fixture(autouse=True)
+    def _use_bitnet(self, settings, monkeypatch):
+        monkeypatch.setattr(settings, "prompt_format", "bitnet")
+
+    def test_mid_conversation_system_message_is_not_dropped(self):
+        """The UI's compaction injects a system summary mid-list; dropping it
+        silently would lose the summarized history exactly when compaction
+        was needed."""
+        prompt = build_prompt(msgs(
+            ("system", "Context summary: earlier facts"),
+            ("user", "next question"),
+        ))
+        assert "Context summary: earlier facts" in prompt
+
+    def test_multiple_system_messages_all_survive(self):
+        prompt = build_prompt(msgs(
+            ("system", "one"), ("system", "two"), ("user", "q"),
+        ))
+        assert "one" in prompt and "two" in prompt
+
+    def test_system_with_no_user_turn_still_reaches_the_model(self):
+        prompt = build_prompt(msgs(("system", "only framing")))
+        assert "only framing" in prompt
+        assert prompt.endswith("BITNETAssistant:")
+
+    def test_trailing_assistant_turn_still_gets_a_generation_prompt(self):
+        """Few-shot lists ending in an assistant example must not leave
+        generation dangling after an end-of-text token with no role."""
+        prompt = build_prompt(msgs(("user", "q"), ("assistant", "example")))
+        assert prompt.endswith("BITNETAssistant:")

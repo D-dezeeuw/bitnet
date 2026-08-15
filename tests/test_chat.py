@@ -639,3 +639,107 @@ class TestLeadingSpaceStrip:
                 if line.startswith("data: ") and line[6:] != "[DONE]":
                     text += json.loads(line[6:])["choices"][0]["delta"].get("content", "")
         assert text == "alpha beta"
+
+
+class TestLoopGuardReviewFindings:
+    """Each of these encodes a defect the adversarial review confirmed in the
+    first version of the guard."""
+
+    async def test_whitespace_flood_is_caught(self, client, backend):
+        """A model emitting endless newlines is a real degenerate mode; the
+        original whitespace skip made the guard permanently blind to it."""
+        backend.content = "An answer." + "\n" * 200
+        r = await client.post("/v1/chat/completions", json=body())
+        content = r.json()["choices"][0]["message"]["content"]
+        assert len(content) < 100
+
+    async def test_dash_banner_survives(self, client, backend):
+        """A 40-dash divider is legitimate formatting, not a loop."""
+        text = "Here is the section:\n" + "-" * 40 + "\nContent below the rule."
+        backend.content = text
+        r = await client.post("/v1/chat/completions", json=body())
+        assert r.json()["choices"][0]["message"]["content"] == text
+
+    async def test_markdown_table_separator_survives(self, client, backend):
+        text = "| a | b | c |\n|---|---|---|---|---|---|---|---|---|\n| 1 | 2 | 3 |"
+        backend.content = text
+        r = await client.post("/v1/chat/completions", json=body())
+        assert r.json()["choices"][0]["message"]["content"] == text
+
+    async def test_long_answer_restated_is_caught(self, client, backend):
+        """The headline failure: the model restating its ENTIRE answer. At
+        MAX_PHRASE=200 a 220-char answer slipped through."""
+        answer = (
+            "String theory proposes that all particles are tiny vibrating "
+            "strings whose vibration patterns determine their properties, and "
+            "it requires several extra spatial dimensions to be mathematically "
+            "consistent with quantum mechanics. "
+        )
+        assert len(answer) > 200
+        backend.content = answer * 5
+        r = await client.post("/v1/chat/completions", json=body())
+        content = r.json()["choices"][0]["message"]["content"]
+        assert content.count("String theory proposes") < 4
+
+    async def test_no_dangling_fragment_after_trim(self, client, backend):
+        """When the tripping chunk straddles a repeat boundary the detected
+        block is a rotation of the true phrase; the trim must not leave a
+        mid-word fragment of it dangling."""
+        backend.content = ("I cannot answer that question. " * 6).strip()
+        r = await client.post("/v1/chat/completions", json=body())
+        content = r.json()["choices"][0]["message"]["content"]
+        assert not content.endswith(("I canno", "I cannot an", "I c"))
+        assert content.count("I cannot answer") >= 1
+
+    async def test_repeats_of_one_is_clamped_not_vacuous(
+        self, client, backend, settings, monkeypatch
+    ):
+        """repeats=1 made the detector trivially true and aborted every
+        generation at its 12th character."""
+        monkeypatch.setattr(settings, "loop_guard_repeats", 1)
+        backend.content = "Hello, world! This is a perfectly ordinary reply."
+        r = await client.post("/v1/chat/completions", json=body())
+        assert (
+            r.json()["choices"][0]["message"]["content"] == backend.content
+        )
+
+    async def test_guard_trip_reports_nonzero_prompt_tokens(self, client, backend):
+        """On an abort the backend's counts chunk never arrives; usage must be
+        estimated, not reported as a 0-token prompt."""
+        backend.content = "The capital of France is Paris. " * 10
+        r = await client.post("/v1/chat/completions", json=body())
+        usage = r.json()["usage"]
+        assert usage["prompt_tokens"] > 0
+        assert usage["completion_tokens"] > 0
+
+    async def test_unterminated_stream_is_reported_as_length(self, client, backend):
+        """A stream that ends without the final chunk did not finish; calling
+        it 'stop' would present the fragment as a complete answer."""
+        backend.truncate_stream = True
+        r = await client.post("/v1/chat/completions", json=body())
+        assert r.json()["choices"][0]["finish_reason"] == "length"
+        assert r.json()["usage"]["prompt_tokens"] > 0
+
+
+class TestTopPDefault:
+    async def test_top_p_disabled_not_omitted(self, client, backend):
+        """Omitting top_p does not turn it off -- the backend then applies its
+        own 0.95 default over the min_p-first design. 1.0 disables it."""
+        await client.post("/v1/chat/completions", json=body())
+        assert backend.requests[-1]["top_p"] == 1.0
+
+
+class TestContinuationSpaceEdgeCase:
+    async def test_flag_without_assistant_tail_still_strips(self, client, backend):
+        """continuation=true with a user-ending history builds a FRESH prompt
+        (the flag is ignored), so the boundary-space strip must apply. The UI
+        hits this by stopping a reply before its first token."""
+        backend.content = " Sure, here it is."
+        r = await client.post(
+            "/v1/chat/completions",
+            json={
+                "messages": [{"role": "user", "content": "hi"}],
+                "continuation": True,
+            },
+        )
+        assert r.json()["choices"][0]["message"]["content"] == "Sure, here it is."

@@ -126,8 +126,12 @@ class Settings:
         # repeats this many times consecutively it aborts the backend request
         # (the pinned llama-server polls for disconnect and frees its slot),
         # trims the repeats, and finishes the response cleanly. 0 disables.
+        # 4 rather than 3: a degenerate loop restates dozens of times, so
+        # the extra repeat costs little, while three identical consecutive
+        # lines (code, list items) are plausible legitimate output that a
+        # threshold of 3 would corrupt.
         self.loop_guard_repeats = (
-            int(os.environ.get("BITNET_LOOP_GUARD_REPEATS", "3"))
+            int(os.environ.get("BITNET_LOOP_GUARD_REPEATS", "4"))
             if _env_flag("BITNET_LOOP_GUARD", True)
             else 0
         )
@@ -387,16 +391,20 @@ def _presented_key(request: Request) -> str:
     return request.headers.get("x-api-key", "").strip()
 
 
-def check_api_key(request: Request) -> None:
-    """Reject the request unless it carries a valid key or session cookie."""
+def request_is_authorized(request: Request) -> bool:
+    """True when the request carries a valid key or session cookie."""
     if not settings.api_key:
-        return
+        return True
     presented = _presented_key(request)
     if presented and hmac.compare_digest(presented, settings.api_key):
-        return
-    if session_token_valid(request.cookies.get(SESSION_COOKIE, "")):
-        return
-    raise HTTPException(status_code=401, detail="Invalid or missing API key")
+        return True
+    return session_token_valid(request.cookies.get(SESSION_COOKIE, ""))
+
+
+def check_api_key(request: Request) -> None:
+    """Reject the request unless it carries a valid key or session cookie."""
+    if not request_is_authorized(request):
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
 # --------------------------------------------------------------------------
@@ -489,12 +497,17 @@ BITNET_GENERATION_PROMPT = "BITNETAssistant:"
 def _build_prompt_bitnet(
     messages: list[Message], *, continuation: bool = False
 ) -> str:
-    """Render the GGUF-embedded template. See build_prompt for the repairs."""
+    """Render the GGUF-embedded template. See build_prompt for the repairs.
+
+    The template has no system branch, so EVERY system message -- wherever it
+    sits, including the compaction summaries the UI injects mid-conversation
+    -- is folded into the next user turn rather than dropped; dropping one
+    silently would discard exactly the summarized history compaction was
+    preserving. A message list that ends without a user turn still gets the
+    generation prompt appended, so generation always starts inside an
+    assistant turn rather than dangling after an end-of-text token.
+    """
     msgs = list(messages)
-    system = ""
-    if msgs and msgs[0].role == "system":
-        system = msgs[0].content.strip()
-        msgs = msgs[1:]
 
     partial: str | None = None
     if continuation and msgs and msgs[-1].role == "assistant":
@@ -502,19 +515,32 @@ def _build_prompt_bitnet(
         msgs = msgs[:-1]
 
     parts: list[str] = []
-    first_user = True
+    pending_system: list[str] = []
     for m in msgs:
-        if m.role == "user":
+        if m.role == "system":
+            pending_system.append(m.content.strip())
+        elif m.role == "user":
             content = m.content.strip()
-            if system and first_user:
-                content = f"{system}\n\n{content}"
-            first_user = False
+            if pending_system:
+                content = "\n\n".join([*pending_system, content])
+                pending_system = []
             parts.append(f"Human: {content}\n\n{BITNET_GENERATION_PROMPT}")
         elif m.role == "assistant":
             parts.append(f" {m.content.strip()}{END_OF_TEXT}")
+    if pending_system:
+        # System content with no user turn after it still reaches the model.
+        parts.append(
+            "Human: " + "\n\n".join(pending_system)
+            + f"\n\n{BITNET_GENERATION_PROMPT}"
+        )
+
     prompt = "".join(parts)
     if partial is not None:
-        prompt += " " + partial
+        if not prompt.endswith(BITNET_GENERATION_PROMPT):
+            prompt += BITNET_GENERATION_PROMPT
+        return prompt + " " + partial
+    if not prompt.endswith(BITNET_GENERATION_PROMPT):
+        prompt += BITNET_GENERATION_PROMPT
     return prompt
 
 
@@ -654,9 +680,12 @@ def backend_payload(req: ChatRequest) -> dict:
         # not the backend's default. min_p keeps tokens by relative probability,
         # which degrades more gracefully than top_p on a flat distribution.
         "min_p": req.min_p if req.min_p is not None else settings.min_p,
+        # Also always sent, because OMITTING top_p does not disable it -- the
+        # backend then applies its own 0.95 default, silently overlaying the
+        # min_p-first design with a second truncation. 1.0 is the value that
+        # actually turns it off.
+        "top_p": req.top_p if req.top_p is not None else 1.0,
     }
-    if req.top_p is not None:
-        payload["top_p"] = req.top_p
     if req.presence_penalty is not None:
         payload["presence_penalty"] = req.presence_penalty
     if req.frequency_penalty is not None:
@@ -716,10 +745,21 @@ class LoopGuard:
     """
 
     MIN_PHRASE = 12
-    MAX_PHRASE = 200
+    # 400 rather than 200: the headline failure is the model restating its
+    # ENTIRE answer verbatim, and a two-sentence answer is easily 200+ chars.
+    MAX_PHRASE = 400
+    # Blocks made of one or two distinct characters -- dashes, table rules
+    # like "---|---|", pure whitespace -- repeat legitimately in banners,
+    # markdown and formatting. They only count as a loop at this much larger
+    # size, so a 40-dash divider survives while a 120+ char character flood
+    # (a real degenerate mode, including endless newlines) is still caught.
+    LOW_DIVERSITY_MIN = 40
 
     def __init__(self, repeats: int) -> None:
-        self.repeats = repeats  # 0 disables
+        # 0 disables; anything else is clamped to >=2, because repeats=1
+        # would make the all() below vacuously true and abort every
+        # generation at its 12th character.
+        self.repeats = max(repeats, 2) if repeats else 0
         self.text = ""
         self.tripped = False
         self._phrase = ""
@@ -733,7 +773,7 @@ class LoopGuard:
         limit = min(self.MAX_PHRASE, len(self.text) // n)
         for size in range(self.MIN_PHRASE, limit + 1):
             block = self.text[-size:]
-            if not block.strip():
+            if len(set(block)) <= 2 and size < self.LOW_DIVERSITY_MIN:
                 continue
             if all(
                 self.text[-(i + 1) * size : len(self.text) - i * size] == block
@@ -750,12 +790,22 @@ class LoopGuard:
         return self.tripped
 
     def trimmed(self) -> str:
-        """The text with trailing repeats collapsed to a single occurrence."""
+        """The text with trailing repeats collapsed to a single occurrence.
+
+        The detected block can be a rotation of the true phrase when the
+        tripping chunk straddles a repeat boundary, which leaves a partial
+        copy dangling after the collapse; the final pass cuts that fragment
+        so the reply does not end mid-word with a visible loop artifact.
+        """
         if not self.tripped:
             return self.text
         out = self.text
         while out.endswith(self._phrase * 2):
             out = out[: -len(self._phrase)]
+        for k in range(len(self._phrase) - 1, 0, -1):
+            if out.endswith(self._phrase + self._phrase[:k]):
+                out = out[:-k]
+                break
         return out
 
 
@@ -780,6 +830,7 @@ async def run_completion(
     chunk_count = 0
     tokens_predicted = 0
     tokens_evaluated = 0
+    saw_final_chunk = False
     finish_reason: str = "stop"
     stream_timeout = httpx.Timeout(
         connect=settings.connect_timeout,
@@ -802,6 +853,7 @@ async def run_completion(
                 if chunk.get("stop", False):
                     # Final chunk: authoritative counts and stop reason. Its
                     # content is empty on this backend; do not feed the guard.
+                    saw_final_chunk = True
                     tokens_predicted = chunk.get("tokens_predicted", chunk_count)
                     tokens_evaluated = chunk.get("tokens_evaluated", 0)
                     finish_reason = finish_reason_from(chunk)
@@ -809,12 +861,32 @@ async def run_completion(
                 chunk_count += 1
                 if guard.feed(chunk.get("content", "")):
                     # Exiting the context closes the connection; the backend
-                    # cancels the generation and frees its slot.
+                    # cancels the generation and frees its slot. The final
+                    # counts chunk never arrives, so both counts are
+                    # estimates: chunks are ~1 token each, and the prompt is
+                    # estimated by the same chars-per-token ratio the budget
+                    # check uses. Approximate beats reporting a 0-token
+                    # prompt to clients doing context accounting.
+                    saw_final_chunk = True
                     finish_reason = "stop"
                     tokens_predicted = chunk_count
+                    tokens_evaluated = int(
+                        len(payload.get("prompt", "")) / CHARS_PER_TOKEN
+                    )
                     break
     except (httpx.HTTPStatusError, httpx.RequestError) as exc:
         raise _backend_error(exc) from exc
+
+    if not saw_final_chunk:
+        # The stream ended with neither the backend's final chunk nor a guard
+        # trip -- the generation did not complete. Labelling the partial text
+        # "stop" would present a truncated reply as finished (and silence the
+        # UI's Continue button and the MCP truncation notice), so report it
+        # as cut short.
+        logger.warning("Backend stream ended without a final chunk")
+        finish_reason = "length"
+        tokens_predicted = chunk_count
+        tokens_evaluated = int(len(payload.get("prompt", "")) / CHARS_PER_TOKEN)
 
     content = guard.trimmed()
     if strip_leading_space and content.startswith(" "):
@@ -860,9 +932,19 @@ async def chat_completion(req: ChatRequest, request: Request):
 
     slot = await acquire_slot(request.app.state.inference_lock)
 
+    # Whether the prompt actually resumed a partial assistant turn -- not
+    # merely whether the caller set the flag. build_prompt ignores
+    # continuation when the last message is not an assistant turn (the UI hits
+    # this by stopping a reply before the first token), and the leading-space
+    # strip must follow what the prompt did, or the boundary space leaks into
+    # fresh replies.
+    resumed = bool(
+        req.continuation and req.messages and req.messages[-1].role == "assistant"
+    )
+
     if req.stream:
         return StreamingResponse(
-            stream_completion(request, payload, slot, req.continuation),
+            stream_completion(request, payload, slot, resumed),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             # Belt-and-braces slot release: if the generator is never iterated
@@ -874,7 +956,7 @@ async def chat_completion(req: ChatRequest, request: Request):
     try:
         start = time.time()
         result = await run_completion(
-            request.app.state, payload, strip_leading_space=not req.continuation
+            request.app.state, payload, strip_leading_space=not resumed
         )
     finally:
         slot.release()
@@ -1085,18 +1167,22 @@ def list_models(request: Request):
 async def status(request: Request):
     """Runtime facts the UI needs. Context size is served from here so it is
     never hardcoded client-side."""
-    return {
+    payload = {
         "busy": request.app.state.inference_lock.locked(),
         "model": settings.model_id,
         "context_size": settings.ctx_size,
         "max_tokens_cap": settings.max_tokens_cap,
         "auth_required": bool(settings.api_key),
-        # Served so the UI can keep the framing prompt alive through context
-        # compaction: the compaction summary is a system message, which would
-        # otherwise silently suppress this default exactly when conversations
-        # get long.
-        "default_system_prompt": settings.system_prompt,
     }
+    # The UI needs this to keep the framing prompt alive through context
+    # compaction (the summary is a system message, which would otherwise
+    # suppress the default). Served only to authorized callers: /v1/status
+    # itself must stay reachable pre-auth, but an operator's custom
+    # BITNET_SYSTEM_PROMPT is configuration, not something every anonymous
+    # visitor should read while the key gates the rest of /v1.
+    if request_is_authorized(request):
+        payload["default_system_prompt"] = settings.system_prompt
+    return payload
 
 
 @app.get("/health")
