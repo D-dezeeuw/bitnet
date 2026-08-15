@@ -26,6 +26,7 @@ commands that apply to whichever mode you used.
 |----------|------|-------------|
 | `GET /health` | no | Health check, including backend status |
 | `GET /v1/status` | no | Busy flag, context size, model id, whether auth is on |
+| `GET /v1/config` | yes | Full effective configuration; powers the UI's Config panel |
 | `GET /v1/models` | yes | List available models |
 | `POST /v1/chat/completions` | yes | Chat completions (streaming + non-streaming) |
 | `POST /v1/summarize` | yes | Summarize conversation context |
@@ -94,11 +95,38 @@ Features:
 - Continue button when output is truncated, resuming the reply rather than restarting it
 - Stop button to halt generation
 - Conversation history with hybrid summarization for context compaction
+- **Config** panel (ⓘ in the header) showing every server-side setting in
+  force — samplers, stops, guardrails, the system prompt, and the actual
+  rendered prompt template — so diagnosing a reply is one screen rather than
+  correlating `.env` against defaults against what the container started with
 
 All assets are served from the container. The UI makes no third-party requests
 and works with outbound network access blocked.
 
 ## Model
+
+### Measured capability
+
+The guardrails stop this model producing *broken* output. They cannot make it
+capable, and it is worth being concrete about where the ceiling sits. Measured
+against the deployment at `temperature 0`:
+
+| Prompt | Result |
+|---|---|
+| "What is the capital of Japan?" | `The capital of Japan is Tokyo.` — correct, ended its own turn at 35 tokens |
+| "Explain string theory in simple terms." | `...describes the structure of strings, which are the strings that are the strings that describe the strings...` |
+| "Explain string theory like I am five." | `Yes, I am five. I am five. Yes, I am five.` — parsed the framing as a statement to agree with |
+
+Short factual recall works. Open-ended explanation degenerates into circular
+restatement, and no combination of template, sampler, or system prompt tested
+here changes that — both shipped chat templates and the full sampler range were
+tried. This is a 2B model at 1.58 bits per weight; the ceiling is the model.
+
+For a deployment that must answer open questions well, the honest fix is a
+different GGUF (Qwen2.5-3B-Instruct or Llama-3.2-3B-Instruct at Q4 run on the
+same llama.cpp with far better instruction following). The proxy, guardrails,
+UI and MCP endpoint here are model-agnostic; only `build_prompt` and the model
+pin are BitNet-specific.
 
 `bitnet-b1.58-2B-4T` is the current and only official **generative** BitNet
 model. Microsoft publishes six BitNet repos, and the newer ones do not replace
@@ -171,6 +199,7 @@ guardrail:
 | Weakness | Guardrail |
 |---|---|
 | Never emits an end-of-turn token on open-ended prompts, restating its answer to the token cap | **Loop guard**: the proxy watches generated text; a phrase repeated `BITNET_LOOP_GUARD_REPEATS` (4) times consecutively aborts the backend generation (freeing the slot), trims the repeats, and finishes cleanly. `BITNET_LOOP_GUARD=0` disables. |
+| Ends its turn by writing the NEXT speaker's label instead of an end token — an observed reply ran `...things fall down.Human: Explain string theory...` and then answered itself | **Role-label stops**, on by default and matched to the active template (`User:`/`System:` for `hf`, `Human:` for `bitnet`). Often the only stop that can fire. `BITNET_ROLE_STOPS=0` disables. |
 | Word-substituted restatements ("simple/easy/clear") | DRY sampling (`BITNET_DRY_MULTIPLIER=0.8`), the n-gram penalty built for it |
 | Rambles without framing | Default system prompt, applied when the caller sends none; kept alive through UI context compaction |
 | Degenerate start from an out-of-distribution boundary token | The generation prompt ends at `Assistant:` with no trailing space; the model supplies the reply's leading space and the API strips it |
@@ -296,6 +325,7 @@ open to anything that can reach the container on the proxy network.
 | `BITNET_LOOP_GUARD` | `1` | Server-side repetition cutoff; `0` disables |
 | `BITNET_LOOP_GUARD_REPEATS` | `4` | Consecutive phrase repeats that trigger the cutoff (min 2; single-character runs use a higher bar so banners and rules survive) |
 | `BITNET_PROMPT_FORMAT` | `hf` | Chat template: `hf` (tokenizer_config) or `bitnet` (GGUF-embedded) |
+| `BITNET_ROLE_STOPS` | `1` | Stop when the model writes the next speaker's label |
 | `BITNET_DRY_BASE` | `1.75` | DRY growth base |
 | `BITNET_DRY_ALLOWED_LENGTH` | `2` | N-gram length DRY tolerates before penalising |
 | `BITNET_QUEUE_TIMEOUT` | `3` | Seconds to wait for the inference slot before `503` |

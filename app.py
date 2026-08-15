@@ -150,12 +150,15 @@ class Settings:
             fmt = "hf"
         self.prompt_format = fmt
 
-        # Pre-MDL-1 the prompt carried no turn separators, so generation had to
-        # be stopped by string-matching "User:". That truncated any reply which
-        # legitimately contained the string. The correct template makes
-        # <|eot_id|> load-bearing instead; set this to re-enable the old
-        # fallback if a model revision ever stops emitting it.
-        self.role_stop_fallback = _env_flag("BITNET_ROLE_STOP_FALLBACK", False)
+        # Stop when the model writes the next speaker's label. Once a
+        # historical fallback (BITNET_ROLE_STOP_FALLBACK, default off) on the
+        # theory that <|eot_id|> was load-bearing; probing the deployment
+        # disproved that -- the model routinely ends a turn by writing
+        # "Human:" or "User:" and no end token at all, so this is often the
+        # ONLY stop that can fire. The cost is a reply that legitimately
+        # contains "User:" mid-sentence being cut there, which is a far
+        # smaller harm than generating to the token cap.
+        self.role_stops = _env_flag("BITNET_ROLE_STOPS", True)
 
         # Kill switch for the MCP endpoint. It shares a process with the API, so
         # a fault there takes the whole container down with it -- entrypoint.sh
@@ -205,7 +208,18 @@ END_OF_TEXT = "<|end_of_text|>"
 # token of a fresh (non-continuation) reply.
 GENERATION_PROMPT = "Assistant:"
 DEFAULT_STOPS = [EOT, END_OF_TEXT]
-ROLE_STOP_FALLBACK = ["User:", "user:"]
+
+# The next turn's role label, per format. Load-bearing rather than a fallback:
+# probing the deployment showed the model frequently ends its turn by writing
+# the NEXT SPEAKER'S LABEL instead of an end-of-turn token -- an observed reply
+# ran "...It is why things fall down.Human: Explain string theory..." and then
+# answered itself. That label is unambiguously a turn boundary, so cutting
+# there is correct, and it is the only stop that fires when the model emits no
+# end token at all. This is what llama.cpp's own -r/reverse-prompt does.
+ROLE_STOPS = {
+    "hf": ["User:", "System:"],
+    "bitnet": ["Human:"],
+}
 
 SESSION_COOKIE = "bitnet_session"
 
@@ -339,6 +353,13 @@ CSP = (
 @app.middleware("http")
 async def security_middleware(request: Request, call_next):
     response = await call_next(request)
+    # The UI is versioned with the image, not the URL, so a browser holding a
+    # cached app.js silently runs an older client against a newer API -- which
+    # presented as a deployed fix appearing not to work at all. no-cache means
+    # "revalidate before use", and StaticFiles serves ETags, so an unchanged
+    # asset still costs only a 304.
+    if request.url.path.startswith("/static") or request.url.path == "/inference":
+        response.headers["Cache-Control"] = "no-cache"
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
@@ -591,8 +612,8 @@ def validate_budget(messages: list[Message], max_tokens: int) -> None:
 
 def resolve_stops(extra: list[str] | None) -> list[str]:
     stops = list(DEFAULT_STOPS)
-    if settings.role_stop_fallback:
-        stops += ROLE_STOP_FALLBACK
+    if settings.role_stops:
+        stops += ROLE_STOPS.get(settings.prompt_format, [])
     if extra:
         stops = [s for s in extra if s] + stops
     return stops
@@ -1183,6 +1204,70 @@ async def status(request: Request):
     if request_is_authorized(request):
         payload["default_system_prompt"] = settings.system_prompt
     return payload
+
+
+@app.get("/v1/config")
+async def config(request: Request):
+    """The full effective configuration, for the UI's info panel.
+
+    Every knob that shapes a reply, resolved to the value actually in force --
+    so diagnosing "why did it answer like that" is reading one screen rather
+    than correlating .env against defaults against what the container was
+    started with. Authenticated: it exposes the system prompt and the
+    deployment's tuning.
+    """
+    check_api_key(request)
+    return {
+        "model": {
+            "id": settings.model_id,
+            "context_size": settings.ctx_size,
+            "max_tokens_cap": settings.max_tokens_cap,
+        },
+        "sampling": {
+            "temperature": settings.temperature,
+            "min_p": settings.min_p,
+            "top_p": "not sent unless the caller sets it (backend default 0.95 is overridden with 1.0 = off)",
+            "repeat_penalty": settings.repeat_penalty,
+            "repeat_last_n": settings.repeat_last_n,
+            "dry_multiplier": settings.dry_multiplier,
+            "dry_base": settings.dry_base,
+            "dry_allowed_length": settings.dry_allowed_length,
+            "dry_penalty_last_n": -1,
+        },
+        "prompt": {
+            "format": settings.prompt_format,
+            "system_prompt": settings.system_prompt,
+            "generation_prompt": (
+                BITNET_GENERATION_PROMPT
+                if settings.prompt_format == "bitnet"
+                else GENERATION_PROMPT
+            ),
+            "example": build_prompt(
+                [
+                    Message(role="system", content="<system prompt>"),
+                    Message(role="user", content="<your message>"),
+                ]
+            ),
+        },
+        "stops": {
+            "default": list(DEFAULT_STOPS),
+            "role_labels": (
+                ROLE_STOPS.get(settings.prompt_format, []) if settings.role_stops else []
+            ),
+            "role_stops_enabled": settings.role_stops,
+        },
+        "guardrails": {
+            "loop_guard_repeats": settings.loop_guard_repeats,
+            "loop_guard_enabled": bool(settings.loop_guard_repeats),
+            "queue_timeout": settings.queue_timeout,
+            "read_timeout": settings.read_timeout,
+            "max_messages": settings.max_messages,
+        },
+        "endpoints": {
+            "mcp_enabled": settings.mcp_enabled,
+            "auth_required": bool(settings.api_key),
+        },
+    }
 
 
 @app.get("/health")

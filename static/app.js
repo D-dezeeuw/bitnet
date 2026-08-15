@@ -397,3 +397,62 @@ async function bootstrap() {
 
 setInterval(pollBusy, 5000);
 bootstrap();
+
+
+/* ---------- config modal ---------- */
+
+const infoBtn = document.getElementById('info-btn');
+const infoModal = document.getElementById('info-modal');
+const infoBody = document.getElementById('info-body');
+
+function renderConfig(cfg) {
+  const frag = document.createDocumentFragment();
+  for (const [group, entries] of Object.entries(cfg)) {
+    const box = document.createElement('div');
+    box.className = 'cfg-group';
+    const h = document.createElement('h3');
+    h.textContent = group.replace(/_/g, ' ');
+    box.appendChild(h);
+    const table = document.createElement('table');
+    table.className = 'cfg-table';
+    for (const [key, value] of Object.entries(entries)) {
+      const tr = document.createElement('tr');
+      const k = document.createElement('td');
+      k.textContent = key.replace(/_/g, ' ');
+      const v = document.createElement('td');
+      // textContent throughout: these values include the system prompt and a
+      // rendered prompt example, which must never be parsed as markup.
+      if (typeof value === 'string' && (value.includes('\n') || value.length > 60)) {
+        v.className = 'cfg-pre';
+      }
+      v.textContent = Array.isArray(value) ? JSON.stringify(value) : String(value);
+      tr.append(k, v);
+      table.appendChild(tr);
+    }
+    box.appendChild(table);
+    frag.appendChild(box);
+  }
+  infoBody.replaceChildren(frag);
+}
+
+async function openConfig() {
+  infoModal.hidden = false;
+  infoBody.textContent = 'Loading…';
+  try {
+    const res = await fetch('/v1/config');
+    if (res.status === 401) { infoBody.textContent = 'Authentication required.'; return; }
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    renderConfig(await res.json());
+  } catch (err) {
+    infoBody.textContent = 'Could not load configuration: ' + err.message;
+  }
+}
+
+function closeConfig() { infoModal.hidden = true; }
+
+infoBtn.addEventListener('click', openConfig);
+document.getElementById('info-close').addEventListener('click', closeConfig);
+infoModal.addEventListener('click', (e) => { if (e.target === infoModal) closeConfig(); });
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && !infoModal.hidden) closeConfig();
+});

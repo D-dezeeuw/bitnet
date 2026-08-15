@@ -112,3 +112,42 @@ async def test_system_prompt_is_served_to_key_holders(client, settings, monkeypa
         await client.get("/v1/status", headers={"Authorization": "Bearer sekrit"})
     ).json()
     assert data["default_system_prompt"] == settings.system_prompt
+
+
+class TestConfigEndpoint:
+    """Powers the UI's config modal: every setting that shapes a reply,
+    resolved to what is actually in force."""
+
+    async def test_reports_the_settings_that_shape_a_reply(self, client, settings):
+        cfg = (await client.get("/v1/config")).json()
+        assert cfg["sampling"]["temperature"] == settings.temperature
+        assert cfg["sampling"]["min_p"] == settings.min_p
+        assert cfg["sampling"]["dry_multiplier"] == settings.dry_multiplier
+        assert cfg["prompt"]["system_prompt"] == settings.system_prompt
+        assert cfg["prompt"]["format"] == settings.prompt_format
+        assert cfg["guardrails"]["loop_guard_repeats"] == settings.loop_guard_repeats
+
+    async def test_shows_the_stops_actually_sent(self, client, settings, monkeypatch):
+        monkeypatch.setattr(settings, "prompt_format", "bitnet")
+        cfg = (await client.get("/v1/config")).json()
+        assert "Human:" in cfg["stops"]["role_labels"]
+
+    async def test_includes_a_rendered_prompt_example(self, client):
+        """Seeing the actual rendered prompt is the fastest way to diagnose a
+        template problem."""
+        cfg = (await client.get("/v1/config")).json()
+        assert "<your message>" in cfg["prompt"]["example"]
+
+    async def test_requires_authentication(self, client, settings, monkeypatch):
+        """It exposes the system prompt and the deployment's tuning."""
+        monkeypatch.setattr(settings, "api_key", "sekrit")
+        assert (await client.get("/v1/config")).status_code == 401
+        ok = await client.get("/v1/config", headers={"Authorization": "Bearer sekrit"})
+        assert ok.status_code == 200
+
+
+async def test_static_assets_must_revalidate(client):
+    """A cached app.js runs an old client against a new API, which presented
+    as a deployed fix appearing not to work."""
+    r = await client.get("/inference")
+    assert r.headers.get("cache-control") == "no-cache"

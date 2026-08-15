@@ -9,7 +9,21 @@
 <body>
 
 <h1>BitNet b1.58 2B-4T</h1>
-<a class="download-link" href="/download">Download</a>
+<div class="header-actions">
+  <a class="download-link" href="/download">Download</a>
+  <button type="button" id="info-btn" class="info-btn" title="Show the model configuration in force" aria-haspopup="dialog">&#9432; Config</button>
+</div>
+
+<div id="info-modal" class="modal" hidden role="dialog" aria-modal="true" aria-labelledby="info-title">
+  <div class="modal-card">
+    <div class="modal-head">
+      <h2 id="info-title">Model configuration</h2>
+      <button type="button" id="info-close" class="modal-close" aria-label="Close">&times;</button>
+    </div>
+    <p class="modal-note">Every setting actually in force on the server, resolved from environment and defaults. Read-only.</p>
+    <div id="info-body" class="modal-body">Loading…</div>
+  </div>
+</div>
 
 <div id="auth-gate" hidden>
   <form id="auth-form">

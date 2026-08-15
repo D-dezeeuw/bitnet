@@ -144,3 +144,49 @@ button:focus-visible, input:focus-visible, summary:focus-visible { outline: 2px 
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; }
 }
+
+/* ---------- config modal ---------- */
+
+.header-actions { display: flex; gap: 8px; justify-content: center; align-items: center; }
+
+.info-btn {
+  background: #1f2937; color: #9ca3af; border: 1px solid #374151;
+  border-radius: 6px; padding: 6px 12px; font-size: 13px; cursor: pointer;
+  font-family: inherit;
+}
+.info-btn:hover { background: #374151; color: #e5e7eb; }
+
+.modal[hidden] { display: none; }
+.modal {
+  position: fixed; inset: 0; background: rgba(0, 0, 0, 0.7);
+  display: flex; align-items: center; justify-content: center;
+  padding: 24px; z-index: 50;
+}
+.modal-card {
+  background: #111827; border: 1px solid #374151; border-radius: 10px;
+  max-width: 780px; width: 100%; max-height: 85vh; display: flex;
+  flex-direction: column; overflow: hidden;
+}
+.modal-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 16px 20px; border-bottom: 1px solid #374151;
+}
+.modal-head h2 { margin: 0; font-size: 16px; color: #e5e7eb; }
+.modal-close {
+  background: none; border: none; color: #9ca3af; font-size: 24px;
+  line-height: 1; cursor: pointer; padding: 0 4px;
+}
+.modal-close:hover { color: #e5e7eb; }
+.modal-note { margin: 0; padding: 12px 20px 0; color: #6b7280; font-size: 12px; }
+.modal-body { padding: 12px 20px 20px; overflow-y: auto; }
+
+.cfg-group { margin-bottom: 18px; }
+.cfg-group h3 {
+  margin: 0 0 8px; font-size: 12px; text-transform: uppercase;
+  letter-spacing: 0.06em; color: #6b7280; font-weight: 600;
+}
+.cfg-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.cfg-table td { padding: 5px 8px; border-bottom: 1px solid #1f2937; vertical-align: top; }
+.cfg-table td:first-child { color: #9ca3af; width: 40%; white-space: nowrap; }
+.cfg-table td:last-child { color: #e5e7eb; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-word; }
+.cfg-table .cfg-pre { white-space: pre-wrap; }

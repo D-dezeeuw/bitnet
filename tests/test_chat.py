@@ -50,14 +50,27 @@ class TestStops:
         await client.post("/v1/chat/completions", json=body())
         assert "<|eot_id|>" in backend.requests[-1]["stop"]
 
-    async def test_role_string_stops_are_off_by_default(self, client, backend):
-        await client.post("/v1/chat/completions", json=body())
-        assert "User:" not in backend.requests[-1]["stop"]
-
-    async def test_role_string_stops_can_be_re_enabled(self, client, backend, settings):
-        settings.role_stop_fallback = True
+    async def test_role_label_stops_are_on_by_default(self, client, backend):
+        """The model routinely ends a turn by writing the next speaker's label
+        instead of an end token, so this is often the only stop that fires."""
         await client.post("/v1/chat/completions", json=body())
         assert "User:" in backend.requests[-1]["stop"]
+
+    async def test_role_label_stops_follow_the_prompt_format(
+        self, client, backend, settings, monkeypatch
+    ):
+        """The bitnet template's next-speaker label is "Human:", not "User:";
+        stopping on the wrong one stops on nothing."""
+        monkeypatch.setattr(settings, "prompt_format", "bitnet")
+        await client.post("/v1/chat/completions", json=body())
+        stops = backend.requests[-1]["stop"]
+        assert "Human:" in stops
+        assert "User:" not in stops
+
+    async def test_role_label_stops_can_be_disabled(self, client, backend, settings, monkeypatch):
+        monkeypatch.setattr(settings, "role_stops", False)
+        await client.post("/v1/chat/completions", json=body())
+        assert "User:" not in backend.requests[-1]["stop"]
 
     async def test_dead_llama2_token_is_gone(self, client, backend):
         await client.post("/v1/chat/completions", json=body())

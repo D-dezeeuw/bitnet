@@ -114,7 +114,7 @@ def settings(monkeypatch):
     """Reset mutable settings between tests."""
     monkeypatch.setattr(app_module.settings, "api_key", None)
     monkeypatch.setattr(app_module.settings, "queue_timeout", 0.2)
-    monkeypatch.setattr(app_module.settings, "role_stop_fallback", False)
+    monkeypatch.setattr(app_module.settings, "role_stops", True)
     # Reset the sampler defaults too. settings is a module-level singleton, so a
     # test that assigns to it directly rather than through monkeypatch leaks the
     # value into every test that follows -- which is exactly what happened.
